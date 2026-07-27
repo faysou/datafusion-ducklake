@@ -7,7 +7,9 @@ use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
-use datafusion_ducklake::{DuckLakeTableWriter, SqliteMetadataWriter, WriteMode};
+use datafusion_ducklake::{
+    DuckLakeTableWriter, SqliteMetadataWriter, TableWriteOptions, WriteMode,
+};
 use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -152,6 +154,142 @@ async fn test_concurrent_writes_same_table_append() {
         let result = task.await.expect("Task panicked");
         assert_eq!(result.unwrap().records_written, 1);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_rejects_table_change_after_expected_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
+
+    let initial = table_writer
+        .write_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[1], &["initial"])],
+        )
+        .await
+        .unwrap();
+    let appended = table_writer
+        .append_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[2], &["concurrent"])],
+        )
+        .await
+        .unwrap();
+
+    let options = TableWriteOptions::new().with_expected_base_snapshot_id(initial.snapshot_id);
+    let mut replacement = table_writer
+        .begin_write(
+            "main",
+            "shared_table",
+            &create_user_schema(),
+            WriteMode::Replace,
+        )
+        .unwrap()
+        .with_options(&options)
+        .unwrap();
+    replacement
+        .write_batch(&create_user_batch(&[3], &["replacement"]))
+        .unwrap();
+    let error = replacement.finish().await.unwrap_err();
+
+    assert!(appended.snapshot_id > initial.snapshot_id);
+    assert!(
+        error.to_string().contains("conflict"),
+        "unexpected replacement error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_accepts_current_expected_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
+
+    let initial = table_writer
+        .write_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[1], &["initial"])],
+        )
+        .await
+        .unwrap();
+    let options = TableWriteOptions::new().with_expected_base_snapshot_id(initial.snapshot_id);
+    let mut replacement = table_writer
+        .begin_write(
+            "main",
+            "shared_table",
+            &create_user_schema(),
+            WriteMode::Replace,
+        )
+        .unwrap()
+        .with_options(&options)
+        .unwrap();
+    replacement
+        .write_batch(&create_user_batch(&[2], &["replacement"]))
+        .unwrap();
+
+    let result = replacement.finish().await.unwrap();
+
+    assert_eq!(result.snapshot_id, initial.snapshot_id + 1);
+    assert_eq!(result.table_id, initial.table_id);
+    assert_eq!(result.schema_id, initial.schema_id);
+    assert_eq!(result.files_written, 1);
+    assert_eq!(result.records_written, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_append_rejects_table_change_after_expected_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
+
+    let initial = table_writer
+        .write_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[1], &["initial"])],
+        )
+        .await
+        .unwrap();
+    let options = TableWriteOptions::new().with_expected_base_snapshot_id(initial.snapshot_id);
+    let mut conditional = table_writer
+        .begin_write(
+            "main",
+            "shared_table",
+            &create_user_schema(),
+            WriteMode::Append,
+        )
+        .unwrap()
+        .with_options(&options)
+        .unwrap();
+    conditional
+        .write_batch(&create_user_batch(&[3], &["conditional"]))
+        .unwrap();
+    let appended = table_writer
+        .append_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[2], &["concurrent"])],
+        )
+        .await
+        .unwrap();
+
+    let error = conditional.finish().await.unwrap_err();
+
+    assert!(appended.snapshot_id > initial.snapshot_id);
+    assert!(
+        error.to_string().contains("conflict"),
+        "unexpected conditional append error: {error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
