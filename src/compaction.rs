@@ -36,12 +36,18 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::Session;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
+use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
 
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceRetirement};
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
+use crate::sort::{SortDirection, SortSpec};
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
 use crate::{DuckLakeError, Result};
@@ -82,12 +88,17 @@ pub struct RewriteOptions {
     /// delete file is at least this value. DuckDB's default is `0.95`. Must be in
     /// `[0.0, 1.0]`.
     pub delete_threshold: f64,
+    /// When set, rewrite only these currently-live data files, regardless of
+    /// their delete fraction. This supports explicit physical maintenance such
+    /// as re-applying a table sort order without changing logical rows.
+    pub data_file_ids: Option<Vec<i64>>,
 }
 
 impl Default for RewriteOptions {
     fn default() -> Self {
         Self {
             delete_threshold: 0.95,
+            data_file_ids: None,
         }
     }
 }
@@ -144,53 +155,52 @@ fn append_snapshot_column(batch: &RecordBatch, origin: i64) -> Result<RecordBatc
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
 }
 
-/// Reorder the rows of a compaction output by the table's live sort order, as one
-/// sorted batch. `batches` may carry trailing embedded columns (rowid, and for a
-/// partial file the per-row snapshot id) beyond `data_schema`; sort keys resolve
-/// to `data_schema` positions (the leading columns), so the embedded columns
-/// travel with their rows. Returns `batches` unchanged when there is no producible
-/// sort order, a key is not in the schema, or there are no rows — sorting only
-/// affects statistics locality, never correctness.
-fn sort_compaction_output(
+/// Stream compaction output through DataFusion's spilling sort.
+///
+/// Batches may carry trailing embedded columns beyond `data_schema`. Sort keys
+/// resolve to the leading data columns, so embedded row lineage stays attached.
+/// An absent sort specification returns the input stream. An unsupported expression
+/// or missing sort column fails before any rewritten file is committed.
+pub(crate) fn sorted_rewrite_output(
+    context: Arc<TaskContext>,
     batches: Vec<RecordBatch>,
     data_schema: &Schema,
-    sort_spec: Option<&crate::sort::SortSpec>,
-) -> Result<Vec<RecordBatch>> {
-    let Some(keys) = sort_spec.and_then(|spec| spec.producible_columns()) else {
-        return Ok(batches);
+    sort_spec: Option<&SortSpec>,
+) -> Result<SendableRecordBatchStream> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| DuckLakeError::Internal("cannot sort empty compaction input".to_string()))?
+        .schema();
+    let input = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+    let Some(sort_spec) = sort_spec else {
+        return Ok(input.execute(0, Arc::clone(&context))?);
     };
-    if keys.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(batches);
-    }
-    let mut resolved = Vec::with_capacity(keys.len());
-    for (name, direction, null_order) in &keys {
-        let Ok(index) = data_schema.index_of(name) else {
-            return Ok(batches);
-        };
-        resolved.push((
-            index,
-            arrow::compute::SortOptions {
-                descending: matches!(direction, crate::sort::SortDirection::Desc),
+    let keys = sort_spec.producible_columns().ok_or_else(|| {
+        DuckLakeError::InvalidConfig(format!(
+            "DuckLake sort order {} contains an unsupported expression; \
+             datafusion-ducklake can write only bare-column sort keys",
+            sort_spec.sort_id
+        ))
+    })?;
+
+    let mut expressions = Vec::with_capacity(keys.len());
+    for (name, direction, null_order) in keys {
+        let index = data_schema.index_of(&name).map_err(|_| {
+            DuckLakeError::InvalidConfig(format!(
+                "DuckLake sort key '{name}' is not present in the rewrite schema"
+            ))
+        })?;
+        expressions.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(&name, index)),
+            SortOptions {
+                descending: direction == SortDirection::Desc,
                 nulls_first: null_order.nulls_first(),
             },
         ));
     }
-    let full_schema = batches[0].schema();
-    let combined = arrow::compute::concat_batches(&full_schema, &batches)?;
-    let sort_columns: Vec<arrow::compute::SortColumn> = resolved
-        .iter()
-        .map(|(index, options)| arrow::compute::SortColumn {
-            values: Arc::clone(combined.column(*index)),
-            options: Some(*options),
-        })
-        .collect();
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
-    let sorted_columns = combined
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c, &indices, None))
-        .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-    Ok(vec![RecordBatch::try_new(full_schema, sorted_columns)?])
+    let ordering = LexOrdering::new(expressions)
+        .ok_or_else(|| DuckLakeError::Internal("sort order is empty".to_string()))?;
+    Ok(SortExec::new(ordering, input).execute(0, context)?)
 }
 
 impl DuckLakeTable {
@@ -364,15 +374,19 @@ impl DuckLakeTable {
             if merged.is_empty() {
                 continue;
             }
-            let merged =
-                sort_compaction_output(merged, physical_schema.as_ref(), sort_spec.as_ref())?;
+            let merged = sorted_rewrite_output(
+                state.task_ctx(),
+                merged,
+                physical_schema.as_ref(),
+                sort_spec.as_ref(),
+            )?;
             let file = table_writer
-                .write_compacted_file(
+                .write_compacted_file_stream(
                     schema_name,
                     self.table_name(),
                     physical_schema.as_ref(),
                     &column_ids,
-                    &merged,
+                    merged,
                     partial,
                 )
                 .await?;
@@ -449,17 +463,26 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
+        let selected_ids = opts
+            .data_file_ids
+            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
         let table_files = self.files()?;
         for tf in &table_files {
             let record_count = tf.max_row_count.unwrap_or(0);
             let delete_count = tf.delete_count.unwrap_or(0);
-            // Only files with a live delete file masking >= threshold of the rows.
-            if tf.delete_file_id.is_none() || record_count <= 0 {
-                continue;
-            }
-            let ratio = delete_count as f64 / record_count as f64;
-            if ratio < opts.delete_threshold {
-                continue;
+            if let Some(selected_ids) = &selected_ids {
+                if !selected_ids.contains(&tf.data_file_id) {
+                    continue;
+                }
+            } else {
+                // Threshold selection only applies to files with live deletes.
+                if tf.delete_file_id.is_none() || record_count <= 0 {
+                    continue;
+                }
+                let ratio = delete_count as f64 / record_count as f64;
+                if ratio < opts.delete_threshold {
+                    continue;
+                }
             }
 
             let scan = self.build_update_scan(state, tf).await?;
@@ -476,18 +499,19 @@ impl DuckLakeTable {
 
             let live_rows = out.matched_count;
             if live_rows > 0 {
-                let sorted = sort_compaction_output(
+                let sorted = sorted_rewrite_output(
+                    state.task_ctx(),
                     out.updated_batches,
                     physical_schema.as_ref(),
                     sort_spec.as_ref(),
                 )?;
                 let file = table_writer
-                    .write_compacted_file(
+                    .write_compacted_file_stream(
                         schema_name,
                         self.table_name(),
                         physical_schema.as_ref(),
                         &column_ids,
-                        &sorted,
+                        sorted,
                         false,
                     )
                     .await?;
@@ -520,5 +544,49 @@ impl DuckLakeTable {
             files_created: outputs.len(),
             rows_written,
         })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sort::{DUCKDB_DIALECT, NullOrder, SortDirection, SortField};
+    use arrow::array::Int64Array;
+    use datafusion::prelude::SessionContext;
+
+    #[test]
+    fn sorted_rewrite_output_rejects_expression_sort_key() {
+        let data_schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![2, 1]))],
+        )
+        .unwrap();
+        let sort_spec = SortSpec {
+            sort_id: 7,
+            fields: vec![SortField {
+                sort_key_index: 0,
+                expression: "lower(id)".to_string(),
+                dialect: DUCKDB_DIALECT.to_string(),
+                direction: SortDirection::Asc,
+                null_order: NullOrder::NullsLast,
+            }],
+        };
+
+        let result = sorted_rewrite_output(
+            SessionContext::new().task_ctx(),
+            vec![batch],
+            &data_schema,
+            Some(&sort_spec),
+        );
+        let err = match result {
+            Ok(_) => panic!("expression sort key must be rejected"),
+            Err(e) => e,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid configuration: DuckLake sort order 7 contains an unsupported expression; \
+             datafusion-ducklake can write only bare-column sort keys",
+        );
     }
 }
