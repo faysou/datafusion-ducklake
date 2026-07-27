@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteResult, validate_delete_entries,
+    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter,
+    SnapshotCommitMetadata, WriteMode, WriteResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
@@ -62,6 +62,44 @@ pub struct DuckLakeWriteOptions {
     /// Max parquet files a partitioned streaming write keeps open at once; `None`
     /// leaves the writer default ([`DEFAULT_MAX_OPEN_PARTITIONS`]).
     pub max_open_partitions: Option<usize>,
+}
+
+/// Options shared by streaming and partitioned table writes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TableWriteOptions {
+    /// Metadata recorded in the snapshot change row.
+    pub commit_metadata: SnapshotCommitMetadata,
+    /// Catalog snapshot against which this write read its input.
+    ///
+    /// The commit fails if the target table's data-file generation changed
+    /// after this snapshot. Commits to other tables do not cause a conflict.
+    pub expected_base_snapshot_id: Option<i64>,
+}
+
+impl TableWriteOptions {
+    /// Creates default write options.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            commit_metadata: SnapshotCommitMetadata::new(),
+            expected_base_snapshot_id: None,
+        }
+    }
+
+    /// Attaches metadata to the committed snapshot.
+    #[must_use]
+    pub fn with_commit_metadata(mut self, commit_metadata: SnapshotCommitMetadata) -> Self {
+        self.commit_metadata = commit_metadata;
+        self
+    }
+
+    /// Requires the write to commit against the target table's data-file
+    /// generation visible at `snapshot_id`.
+    #[must_use]
+    pub const fn with_expected_base_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.expected_base_snapshot_id = Some(snapshot_id);
+        self
+    }
 }
 
 /// High-level writer for DuckLake tables.
@@ -441,6 +479,7 @@ impl DuckLakeTableWriter {
             table_name: table_name.to_string(),
             snapshot_id: setup.snapshot_id,
             base_snapshot_id: setup.base_snapshot_id,
+            expected_base_snapshot_id: None,
             table_id: setup.table_id,
             columns,
             column_ids: setup.column_ids,
@@ -453,6 +492,7 @@ impl DuckLakeTableWriter {
             row_count: 0,
             nan_flags: Vec::new(),
             partition_sink,
+            commit_metadata: SnapshotCommitMetadata::default(),
         })
     }
 
@@ -745,6 +785,63 @@ impl DuckLakeTableWriter {
         key_names: &[String],
         groups: Vec<PartitionGroup>,
     ) -> Result<WriteResult> {
+        self.write_partitioned_with_commit_metadata(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            partition_id,
+            key_names,
+            groups,
+            &SnapshotCommitMetadata::default(),
+        )
+        .await
+    }
+
+    /// Writes a partitioned dataset with metadata attached to its snapshot.
+    ///
+    /// Returns an error when the configured metadata writer does not support
+    /// non-empty commit metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_partitioned_with_commit_metadata(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        partition_id: i64,
+        key_names: &[String],
+        groups: Vec<PartitionGroup>,
+        commit_metadata: &SnapshotCommitMetadata,
+    ) -> Result<WriteResult> {
+        let options = TableWriteOptions::new().with_commit_metadata(commit_metadata.clone());
+        self.write_partitioned_with_options(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            partition_id,
+            key_names,
+            groups,
+            &options,
+        )
+        .await
+    }
+
+    /// Writes a partitioned dataset with snapshot metadata and an optional
+    /// replacement precondition.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_partitioned_with_options(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        partition_id: i64,
+        key_names: &[String],
+        groups: Vec<PartitionGroup>,
+        options: &TableWriteOptions,
+    ) -> Result<WriteResult> {
         if groups.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "write_partitioned: no partition groups".to_string(),
@@ -802,16 +899,20 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let committed = self.metadata.register_data_files(
+        let committed = self.metadata.register_data_files_with_commit_metadata(
             setup.table_id,
             schema_name,
             table_name,
             setup.snapshot_id,
             &file_infos,
             mode,
-            setup.base_snapshot_id,
+            options
+                .expected_base_snapshot_id
+                .unwrap_or(setup.base_snapshot_id),
             &columns,
             &setup.column_ids,
+            &options.commit_metadata,
+            options.expected_base_snapshot_id,
         )?;
 
         Ok(WriteResult {
@@ -1501,6 +1602,8 @@ pub struct TableWriteSession {
     /// `register_data_file` so a `Replace` commit can abort if another writer
     /// published a newer generation of the table since this write began.
     base_snapshot_id: i64,
+    /// Explicit table-state precondition supplied through [`TableWriteOptions`].
+    expected_base_snapshot_id: Option<i64>,
     table_id: i64,
     /// Column generation for this write (in `column_order`). Threaded to the
     /// metadata writer at `finish()` so single-catalog backends, which defer the
@@ -1533,9 +1636,34 @@ pub struct TableWriteSession {
     /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
     /// every file the sink produced in a single snapshot.
     partition_sink: Option<PartitionSink>,
+    commit_metadata: SnapshotCommitMetadata,
 }
 
 impl TableWriteSession {
+    /// Applies snapshot metadata and an optional table-state precondition.
+    ///
+    /// # Errors
+    ///
+    /// The metadata backend must support conditional commits.
+    pub fn with_options(mut self, options: &TableWriteOptions) -> Result<Self> {
+        self.commit_metadata = options.commit_metadata.clone();
+        if let Some(snapshot_id) = options.expected_base_snapshot_id {
+            self.base_snapshot_id = snapshot_id;
+        }
+        self.expected_base_snapshot_id = options.expected_base_snapshot_id;
+        Ok(self)
+    }
+
+    /// Attaches metadata to the snapshot committed by this write.
+    ///
+    /// [`Self::finish`] returns an error when the configured metadata writer
+    /// does not support non-empty commit metadata.
+    #[must_use]
+    pub fn with_commit_metadata(mut self, commit_metadata: SnapshotCommitMetadata) -> Self {
+        self.commit_metadata = commit_metadata;
+        self
+    }
+
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         // Partitioned target: validate up front so the shared borrow of `self` that
         // `validate_batch_schema` takes is released before the sink is borrowed mutably.
@@ -1658,7 +1786,7 @@ impl TableWriteSession {
         // register_data_file returns the ids actually committed (snapshot id
         // assigned at commit; real schema/table ids, which may differ from the
         // begin-time reservations under a concurrent create). Report those.
-        let committed = self.metadata.register_data_file(
+        let committed = self.metadata.register_data_file_with_commit_metadata(
             self.table_id,
             &self.schema_name,
             &self.table_name,
@@ -1668,6 +1796,8 @@ impl TableWriteSession {
             self.base_snapshot_id,
             &self.columns,
             &self.column_ids,
+            &self.commit_metadata,
+            self.expected_base_snapshot_id,
         )?;
 
         Ok(WriteResult {
@@ -1698,18 +1828,22 @@ impl TableWriteSession {
             ));
         }
         let file_info = self.upload_staged().await?;
-        let committed = self.metadata.register_data_file_with_deletes(
-            self.table_id,
-            &self.schema_name,
-            &self.table_name,
-            self.snapshot_id,
-            &file_info,
-            deletes,
-            self.mode,
-            self.base_snapshot_id,
-            &self.columns,
-            &self.column_ids,
-        )?;
+        let committed = self
+            .metadata
+            .register_data_file_with_deletes_and_commit_metadata(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &file_info,
+                deletes,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.column_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )?;
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
