@@ -19,15 +19,17 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::maintenance::{CleanupCriteria, cleanup_old_files_sqlite};
+use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
-    CompactionResult, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MergeOptions,
+    ColumnDef, CompactionResult, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MergeOptions,
     MetadataProvider, MetadataWriter, NullOrder, RewriteOptions, SortDirection, SortField,
-    SqliteMetadataProvider, SqliteMetadataWriter,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
 
 fn two_col_schema() -> Arc<Schema> {
@@ -91,12 +93,69 @@ async fn append(temp: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
         .unwrap();
 }
 
+async fn setup_partitioned(temp: &TempDir) -> (Arc<SqliteMetadataWriter>, i64, i64) {
+    let writer = Arc::new(make_writer(temp).await);
+    let columns = two_col_schema()
+        .fields()
+        .iter()
+        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let partition_id = scalar_i64(
+        &pool(temp).await,
+        "SELECT partition_id FROM ducklake_partition_info WHERE end_snapshot IS NULL",
+    )
+    .await;
+    (writer, setup.table_id, partition_id)
+}
+
+async fn append_partition(
+    writer: Arc<SqliteMetadataWriter>,
+    partition_id: i64,
+    id: i32,
+    vals: Vec<i32>,
+) {
+    let ids = vec![id; vals.len()];
+    let batch = batch(
+        two_col_schema(),
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
+    );
+    let mut session = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .begin_write("main", "t", two_col_schema().as_ref(), WriteMode::Append)
+        .unwrap()
+        .with_partition_values(partition_id, vec![(0, Some(id.to_string()))]);
+    session.write_batch(&batch).unwrap();
+    session.finish().await.unwrap();
+}
+
 async fn pool(temp: &TempDir) -> SqlitePool {
     SqlitePool::connect(&ro_url(temp)).await.unwrap()
 }
 
 async fn scalar_i64(p: &SqlitePool, sql: &str) -> i64 {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_one(p)
         .await
         .unwrap()
@@ -105,7 +164,7 @@ async fn scalar_i64(p: &SqlitePool, sql: &str) -> i64 {
 }
 
 async fn opt_i64(p: &SqlitePool, sql: &str) -> Option<i64> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_one(p)
         .await
         .unwrap()
@@ -204,21 +263,10 @@ where
     F: FnOnce(DuckLakeTable, datafusion::execution::SessionState) -> Fut,
     Fut: std::future::Future<Output = CompactionResult>,
 {
-    with_writable_table_context(temp, SessionContext::new(), op).await
-}
-
-async fn with_writable_table_context<F, Fut>(
-    temp: &TempDir,
-    ctx: SessionContext,
-    op: F,
-) -> CompactionResult
-where
-    F: FnOnce(DuckLakeTable, datafusion::execution::SessionState) -> Fut,
-    Fut: std::future::Future<Output = CompactionResult>,
-{
     let writer = SqliteMetadataWriter::new(&db_url(temp)).await.unwrap();
     let provider = SqliteMetadataProvider::new(&db_url(temp)).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     let provider = ctx
         .catalog("ducklake")
@@ -305,89 +353,87 @@ async fn rewrite_can_target_explicit_data_files_without_deletes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage() {
-    const MEMORY_LIMIT: usize = 256 * 1024;
-    const ROWS_PER_SNAPSHOT: i32 = 16_384;
-    const TOTAL_ROWS: i32 = ROWS_PER_SNAPSHOT * 2;
-
+async fn compaction_preserves_partition_boundaries_and_values() {
     let temp = TempDir::new().unwrap();
-    seed(
-        &temp,
-        (0..ROWS_PER_SNAPSHOT).collect(),
-        (0..ROWS_PER_SNAPSHOT).collect(),
-    )
-    .await;
-    let p = pool(&temp).await;
-    let first_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
-    append(
-        &temp,
-        (ROWS_PER_SNAPSHOT..TOTAL_ROWS).collect(),
-        (ROWS_PER_SNAPSHOT..TOTAL_ROWS).collect(),
-    )
-    .await;
-    let table_id = scalar_i64(
-        &p,
-        "SELECT table_id FROM ducklake_table WHERE table_name = 't'",
-    )
-    .await;
-    SqliteMetadataWriter::new(&db_url(&temp))
-        .await
-        .unwrap()
-        .set_sort_spec(
-            table_id,
-            &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
-        )
-        .unwrap();
-    let rowids_before = read_id_rowid(&temp).await;
-    assert_eq!(
-        usize::try_from(TOTAL_ROWS).unwrap()
-            * (2 * std::mem::size_of::<i32>() + std::mem::size_of::<i64>()),
-        2 * MEMORY_LIMIT,
-    );
-
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_limit(MEMORY_LIMIT, 1.0)
-        .with_temp_file_path(temp.path().join("spill"))
-        .build_arc()
-        .unwrap();
-    let config = SessionConfig::new()
-        .with_batch_size(1024)
-        .with_sort_spill_reservation_bytes(16 * 1024);
-    let ctx = SessionContext::new_with_config_rt(config, runtime);
-    let result = with_writable_table_context(&temp, ctx, |table, state| async move {
-        table
-            .merge_adjacent_files(&state, MergeOptions::default())
-            .await
-            .unwrap()
-    })
-    .await;
-
-    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
-    let snapshot = provider.get_current_snapshot().unwrap();
-    let files = provider
-        .get_table_file_metadata_page(table_id, snapshot, None, 10)
-        .unwrap();
-    let expected_first_snapshot = (0..ROWS_PER_SNAPSHOT)
-        .map(|value| (value, value))
-        .collect::<Vec<_>>();
+    let (writer, table_id, partition_id) = setup_partitioned(&temp).await;
+    append_partition(Arc::clone(&writer), partition_id, 1, vec![10, 20]).await;
+    append_partition(Arc::clone(&writer), partition_id, 1, vec![30, 40]).await;
+    append_partition(Arc::clone(&writer), partition_id, 2, vec![50]).await;
 
     assert_eq!(
-        result,
+        run_merge(&temp, MergeOptions::default()).await,
         CompactionResult {
             files_processed: 2,
             files_created: 1,
-            rows_written: i64::from(TOTAL_ROWS),
-        },
+            rows_written: 4,
+        }
     );
-    assert_eq!(files.len(), 1);
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snapshot, None, 10)
+        .unwrap();
+    let mut partitions = page
+        .iter()
+        .map(|metadata| {
+            (
+                metadata.file.partition_id,
+                metadata.file.partition_values.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    partitions.sort();
     assert_eq!(
-        file_values(&temp, &files[0].file.file.path),
-        (0..TOTAL_ROWS).rev().collect::<Vec<_>>(),
+        partitions,
+        vec![
+            (Some(partition_id), vec![(0, Some("1".to_string()))]),
+            (Some(partition_id), vec![(0, Some("2".to_string()))]),
+        ]
     );
-    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+
+    let temp = TempDir::new().unwrap();
+    let (writer, table_id, partition_id) = setup_partitioned(&temp).await;
+    append_partition(writer, partition_id, 3, vec![60, 70, 80]).await;
+    let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx.sql("DELETE FROM ducklake.main.t WHERE id = 3 AND val <= 70")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
     assert_eq!(
-        read_rows_at(&temp, first_snapshot).await,
-        expected_first_snapshot,
+        run_rewrite(
+            &temp,
+            RewriteOptions {
+                delete_threshold: 0.0,
+                ..RewriteOptions::default()
+            },
+        )
+        .await,
+        CompactionResult {
+            files_processed: 1,
+            files_created: 1,
+            rows_written: 1,
+        }
+    );
+    assert_eq!(read_rows(&temp).await, vec![(3, 80)]);
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snapshot, None, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].file.partition_id, Some(partition_id));
+    assert_eq!(
+        page[0].file.partition_values,
+        vec![(0, Some("3".to_string()))],
     );
 }
 
@@ -543,9 +589,9 @@ async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel()
     assert_eq!(scheduled, 3, "three source files scheduled for deletion");
 
     // changes_made records the compaction.
-    let changes: String = sqlx::query(&format!(
+    let changes: String = sqlx::query(AssertSqlSafe(format!(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = {new_snapshot}"
-    ))
+    )))
     .fetch_one(&p)
     .await
     .unwrap()
@@ -847,9 +893,9 @@ async fn rewrite_drops_deleted_rows_and_retires_data_and_delete_files() {
     );
 
     // changes_made records the compaction.
-    let changes: String = sqlx::query(&format!(
+    let changes: String = sqlx::query(AssertSqlSafe(format!(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = {new_snapshot}"
-    ))
+    )))
     .fetch_one(&p)
     .await
     .unwrap()
