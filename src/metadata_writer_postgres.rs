@@ -14,8 +14,8 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
-    validate_name,
+    MetadataWriter, SnapshotCommitMetadata, WriteMode, WriteSetupResult, columns_differ,
+    table_write_changes, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::AssertSqlSafe;
@@ -158,9 +158,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // NULL means "not partitioned", correct for every pre-partitioning file.
     r#"ALTER TABLE ducklake_data_file
         ADD COLUMN IF NOT EXISTS partition_id BIGINT"#,
-    // Per-snapshot change ledger (DuckLake spec). The compaction commit records
-    // `compacted_table:<table_id>` here so DuckDB and other spec readers can
-    // attribute the snapshot; other commit paths do not populate it yet.
+    // Per-snapshot change ledger (DuckLake spec).
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
         snapshot_id BIGINT PRIMARY KEY,
         changes_made VARCHAR NOT NULL,
@@ -1164,7 +1162,62 @@ async fn finalize_snapshot(
         retire_prior_generation(table_id, snapshot_id, tx).await?;
     }
 
+    let mut ddl_changes = Vec::new();
+    if schema_was_created {
+        ddl_changes.push(format!(
+            "created_schema:{}",
+            crate::metadata_writer::quote_snapshot_name(schema_name),
+        ));
+    }
+    if table_was_created {
+        ddl_changes.push(format!(
+            "created_table:{}",
+            crate::metadata_writer::quote_snapshot_name(table_name),
+        ));
+    } else if is_ddl {
+        ddl_changes.push(format!("altered_table:{table_id}"));
+    }
+    if !ddl_changes.is_empty() {
+        record_snapshot_changes(
+            tx,
+            snapshot_id,
+            &ddl_changes.join(","),
+            &SnapshotCommitMetadata::default(),
+        )
+        .await?;
+    }
+
     Ok((snapshot_id, schema_id, table_id))
+}
+
+async fn record_snapshot_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    changes_made: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes
+             (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (snapshot_id) DO UPDATE SET
+             changes_made = CASE
+                 WHEN ducklake_snapshot_changes.changes_made = '' THEN EXCLUDED.changes_made
+                 WHEN EXCLUDED.changes_made = '' THEN ducklake_snapshot_changes.changes_made
+                 ELSE ducklake_snapshot_changes.changes_made || ',' || EXCLUDED.changes_made
+             END,
+             author = EXCLUDED.author,
+             commit_message = EXCLUDED.commit_message,
+             commit_extra_info = EXCLUDED.commit_extra_info",
+    )
+    .bind(snapshot_id)
+    .bind(changes_made)
+    .bind(commit_metadata.author())
+    .bind(commit_metadata.message())
+    .bind(commit_metadata.extra_info())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
@@ -1189,6 +1242,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(&mut tx, snapshot_id, "", &SnapshotCommitMetadata::default())
+                .await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -1294,6 +1349,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+
             // Retire the live row, insert the new version with the SAME column_id
             // (OVERRIDING SYSTEM VALUE — column_id is IDENTITY). Retire-before-insert
             // keeps the live-version partial unique index satisfied at all times.
@@ -1375,6 +1438,16 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_schema:{}",
+                    crate::metadata_writer::quote_snapshot_name(name),
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok((schema_id, true))
         })
@@ -1421,6 +1494,16 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             let id: i64 = row.try_get(0)?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_table:{}",
+                    crate::metadata_writer::quote_snapshot_name(name),
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok((id, true))
         })
@@ -1441,6 +1524,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let table_begin_snapshot: i64 =
+                sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
 
             sqlx::query(
                 "UPDATE ducklake_column SET end_snapshot = $1
@@ -1468,6 +1556,15 @@ impl MetadataWriter for PostgresMetadataWriter {
                 column_ids.push(row.try_get(0)?);
             }
 
+            if table_begin_snapshot != snapshot_id {
+                record_snapshot_changes(
+                    &mut tx,
+                    snapshot_id,
+                    &format!("altered_table:{table_id}"),
+                    &SnapshotCommitMetadata::default(),
+                )
+                .await?;
+            }
             tx.commit().await?;
             Ok(column_ids)
         })
@@ -1478,12 +1575,41 @@ impl MetadataWriter for PostgresMetadataWriter {
         table_id: i64,
         schema_name: &str,
         table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_file_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         block_on(async {
             // Single atomic commit. finalize_snapshot writes ALL metadata (the
@@ -1513,6 +1639,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+            }
 
             // Partition-spec fence: this file must be consistent with the table's live
             // partition generation at commit time (both directions — see
@@ -1586,6 +1717,19 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let replaced_existing_data: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = $1 AND end_snapshot = $2
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
+
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
@@ -1604,12 +1748,42 @@ impl MetadataWriter for PostgresMetadataWriter {
         table_id: i64,
         schema_name: &str,
         table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         files: &[DataFileInfo],
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         if files.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
@@ -1632,6 +1806,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+            }
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.
             // Runs inside the lock_catalog-serialized tx; rolls back on a Conflict.
@@ -1702,6 +1881,18 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            let replaced_existing_data: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = $1 AND end_snapshot = $2
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
             tx.commit().await?;
@@ -1826,6 +2017,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -1838,7 +2036,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
             // Nothing to reset → report the current head without a new snapshot.
-            let has_live: Option<i64> = sqlx::query_scalar(
+            let has_live: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_partition_info
                  WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
             )
@@ -1904,6 +2102,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -1986,6 +2191,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -1998,7 +2210,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
             // Nothing to reset → report the current head without a new snapshot.
-            let has_live: Option<i64> = sqlx::query_scalar(
+            let has_live: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_sort_info
                  WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
             )
@@ -2025,7 +2237,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -2287,6 +2505,36 @@ impl MetadataWriter for PostgresMetadataWriter {
         table_id: i64,
         schema_name: &str,
         table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_file_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         file: &DataFileInfo,
         deletes: &[DeleteFileEntry],
@@ -2294,6 +2542,8 @@ impl MetadataWriter for PostgresMetadataWriter {
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         validate_delete_entries(mode, deletes)?;
         block_on(async {
@@ -2319,6 +2569,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+            }
 
             // Register the new data file (the inserted row versions), exactly as
             // register_data_file: seed stats, draw the row-id range, insert, and
@@ -2444,6 +2699,20 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            let replaced_existing_data: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = $1 AND end_snapshot = $2
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made =
+                table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
 
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
@@ -3107,6 +3376,24 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .await?;
 
+            let replaced_existing_data: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = $1 AND end_snapshot = $2
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;

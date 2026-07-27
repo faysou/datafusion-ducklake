@@ -9,10 +9,13 @@
 //! - Per-catalog dense `schema_version` allocation
 //! - No orphan mapping rows after writes
 
-use datafusion_ducklake::metadata_writer::{ColumnDef, MetadataWriter, WriteMode};
+use datafusion_ducklake::metadata_writer::{
+    ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
+};
 use datafusion_ducklake::{
-    DuckLakeError, DuckLakeTableWriter, MulticatalogManager, PostgresMetadataWriter,
-    TypeChangeOperation, TypeChangeWriteMode, initialize_multicatalog_schema,
+    DuckLakeError, DuckLakeTableWriter, MulticatalogManager, NullOrder, PartitionTransform,
+    PostgresMetadataWriter, SortDirection, SortField, TableWriteOptions, TypeChangeOperation,
+    TypeChangeWriteMode, initialize_multicatalog_schema,
 };
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
@@ -110,6 +113,426 @@ async fn visible_records_at_head(pool: &PgPool, catalog_id: i64, table_id: i64) 
     .unwrap()
     .try_get(0)
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_writes_record_snapshot_changes_and_commit_metadata() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("snapshot_changes")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+
+    let first = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Replace)
+        .unwrap();
+    let first_commit = writer
+        .register_data_file(
+            first.table_id,
+            "public",
+            "events",
+            first.snapshot_id,
+            &DataFileInfo::new("first.parquet", 1_024, 11),
+            WriteMode::Replace,
+            first.base_snapshot_id,
+            &cols(),
+            &first.column_ids,
+        )
+        .unwrap();
+
+    let second = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Append)
+        .unwrap();
+    let commit_metadata = SnapshotCommitMetadata::new()
+        .with_author("Jane Doe")
+        .with_message("Append imported events")
+        .with_extra_info("opaque-import-id");
+    let second_commit = writer
+        .register_data_file_with_commit_metadata(
+            second.table_id,
+            "public",
+            "events",
+            second.snapshot_id,
+            &DataFileInfo::new("second.parquet", 2_048, 17),
+            WriteMode::Append,
+            second.base_snapshot_id,
+            &cols(),
+            &second.column_ids,
+            &commit_metadata,
+            None,
+        )
+        .unwrap();
+
+    let rows = sqlx::query(
+        "SELECT c.snapshot_id, c.changes_made, c.author, c.commit_message,
+                c.commit_extra_info
+         FROM ducklake_snapshot_changes c
+         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = c.snapshot_id
+         WHERE m.catalog_id = $1
+         ORDER BY c.snapshot_id",
+    )
+    .bind(catalog_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<i64, _>("snapshot_id").unwrap(),
+                row.try_get::<String, _>("changes_made").unwrap(),
+                row.try_get::<Option<String>, _>("author").unwrap(),
+                row.try_get::<Option<String>, _>("commit_message").unwrap(),
+                row.try_get::<Option<String>, _>("commit_extra_info")
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (
+                first_commit.snapshot_id,
+                format!(
+                    "created_schema:\"public\",created_table:\"events\",\
+                     inserted_into_table:{}",
+                    first.table_id
+                ),
+                None,
+                None,
+                None,
+            ),
+            (
+                second_commit.snapshot_id,
+                format!("inserted_into_table:{}", second.table_id),
+                Some("Jane Doe".to_string()),
+                Some("Append imported events".to_string()),
+                Some("opaque-import-id".to_string()),
+            ),
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_fileless_and_partition_ddl_record_snapshot_changes() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("snapshot_ddl")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+
+    let bare_snapshot = writer.create_snapshot().unwrap();
+    let setup = writer
+        .begin_write_transaction("ma\"in", "ev\"ents", &cols(), WriteMode::Replace)
+        .unwrap();
+    let published = writer
+        .publish_snapshot(
+            setup.table_id,
+            "ma\"in",
+            "ev\"ents",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+    let partition_snapshot = writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let reset_snapshot = writer.reset_partition_spec(setup.table_id).unwrap();
+
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT changes.snapshot_id, changes.changes_made
+         FROM ducklake_snapshot_changes changes
+         JOIN ducklake_catalog_snapshot_map map
+           ON map.snapshot_id = changes.snapshot_id
+         WHERE map.catalog_id = $1
+         ORDER BY changes.snapshot_id",
+    )
+    .bind(catalog_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (bare_snapshot, String::new()),
+            (
+                published.snapshot_id,
+                format!(
+                    "created_schema:\"ma\"\"in\",created_table:\"ev\"\"ents\",\
+                     inserted_into_table:{}",
+                    setup.table_id,
+                ),
+            ),
+            (
+                partition_snapshot,
+                format!("altered_table:{}", setup.table_id),
+            ),
+            (reset_snapshot, format!("altered_table:{}", setup.table_id),),
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_partitioned_write_honors_expected_snapshot() {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("partition_fencing")
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let metadata: Arc<dyn MetadataWriter> = writer.clone();
+    let table_writer = DuckLakeTableWriter::new(metadata, store).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let initial_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let initial = table_writer
+        .write_table("public", "events", &[initial_batch])
+        .await
+        .unwrap();
+    let partition_snapshot = writer
+        .set_partition_spec(
+            initial.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let partition_id: i64 = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(initial.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let options = TableWriteOptions::new().with_expected_base_snapshot_id(partition_snapshot);
+    let append_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+
+    let appended = table_writer
+        .write_partitioned_with_options(
+            "public",
+            "events",
+            schema.as_ref(),
+            WriteMode::Append,
+            partition_id,
+            &["id".to_string()],
+            vec![(vec![Some("2".to_string())], vec![append_batch])],
+            &options,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(appended.snapshot_id, partition_snapshot + 1);
+    assert_eq!(appended.table_id, initial.table_id);
+    assert_eq!(appended.schema_id, initial.schema_id);
+    assert_eq!(appended.files_written, 1);
+    assert_eq!(appended.records_written, 1);
+
+    let stale_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3]))],
+    )
+    .unwrap();
+    let error = table_writer
+        .write_partitioned_with_options(
+            "public",
+            "events",
+            schema.as_ref(),
+            WriteMode::Append,
+            partition_id,
+            &["id".to_string()],
+            vec![(vec![Some("3".to_string())], vec![stale_batch])],
+            &options,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("conflict"),
+        "unexpected partitioned-write error: {error}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn conditional_append_rejects_table_change_after_expected_snapshot() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("conditional_append")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+
+    let initial = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Replace)
+        .unwrap();
+    let initial_commit = writer
+        .register_data_file(
+            initial.table_id,
+            "public",
+            "events",
+            initial.snapshot_id,
+            &DataFileInfo::new("initial.parquet", 1_024, 11),
+            WriteMode::Replace,
+            initial.base_snapshot_id,
+            &cols(),
+            &initial.column_ids,
+        )
+        .unwrap();
+    let conditional = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Append)
+        .unwrap();
+    let concurrent = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Append)
+        .unwrap();
+    let concurrent_commit = writer
+        .register_data_file(
+            concurrent.table_id,
+            "public",
+            "events",
+            concurrent.snapshot_id,
+            &DataFileInfo::new("concurrent.parquet", 2_048, 17),
+            WriteMode::Append,
+            concurrent.base_snapshot_id,
+            &cols(),
+            &concurrent.column_ids,
+        )
+        .unwrap();
+
+    let error = writer
+        .register_data_file_with_commit_metadata(
+            conditional.table_id,
+            "public",
+            "events",
+            conditional.snapshot_id,
+            &DataFileInfo::new("conditional.parquet", 4_096, 23),
+            WriteMode::Append,
+            initial_commit.snapshot_id,
+            &cols(),
+            &conditional.column_ids,
+            &SnapshotCommitMetadata::default(),
+            Some(initial_commit.snapshot_id),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, DuckLakeError::Conflict(_)));
+    assert_eq!(
+        current_head(&pool, catalog_id).await,
+        concurrent_commit.snapshot_id
+    );
+    assert_eq!(
+        visible_records_at_head(&pool, catalog_id, initial.table_id).await,
+        28,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_sort_ddl_records_snapshot_changes() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("sort_order")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("public", "events", &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            setup.table_id,
+            "public",
+            "events",
+            setup.snapshot_id,
+            &DataFileInfo::new("events.parquet", 1_024, 11),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+
+    let field = SortField::column(0, "name", SortDirection::Desc, NullOrder::NullsFirst);
+    let set_snapshot = writer.set_sort_spec(setup.table_id, &[field]).unwrap();
+
+    let row = sqlx::query(
+        "SELECT e.expression, e.dialect, e.sort_direction, e.null_order, c.changes_made
+         FROM ducklake_sort_info i
+         JOIN ducklake_sort_expression e
+           ON e.sort_id = i.sort_id AND e.table_id = i.table_id
+         JOIN ducklake_snapshot_changes c ON c.snapshot_id = i.begin_snapshot
+         WHERE i.table_id = $1 AND i.end_snapshot IS NULL",
+    )
+    .bind(setup.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<String, _>("expression").unwrap(), "name");
+    assert_eq!(row.try_get::<String, _>("dialect").unwrap(), "duckdb");
+    assert_eq!(row.try_get::<String, _>("sort_direction").unwrap(), "DESC");
+    assert_eq!(
+        row.try_get::<String, _>("null_order").unwrap(),
+        "NULLS_FIRST"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("changes_made").unwrap(),
+        format!("altered_table:{}", setup.table_id),
+    );
+
+    let reset_snapshot = writer.reset_sort_spec(setup.table_id).unwrap();
+    assert!(reset_snapshot > set_snapshot);
+    let end_snapshot: i64 =
+        sqlx::query("SELECT end_snapshot FROM ducklake_sort_info WHERE table_id = $1")
+            .bind(setup.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(end_snapshot, reset_snapshot);
 }
 
 /// #864: the postgres `set_delete_file` write — fenced, cumulative,
@@ -2405,6 +2828,14 @@ async fn drop_table_in_catalog_bumps_schema_version_as_ddl() {
         v_drop, 2,
         "drop snapshot must bump schema_version (DDL change)"
     );
+    let drop_change: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+    )
+    .bind(drop_snap)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(drop_change, format!("dropped_table:{}", s.table_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
