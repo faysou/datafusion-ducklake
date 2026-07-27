@@ -86,6 +86,64 @@ pub const DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_646;
 /// 2`), NOT Iceberg's `2147483545`. See [`DELETE_FILE_PATH_FIELD_ID`].
 pub const DELETE_POS_FIELD_ID: i32 = 2_147_483_645;
 
+struct FileMetadataPages<'a> {
+    provider: &'a dyn MetadataProvider,
+    table_id: i64,
+    snapshot_id: i64,
+    after_data_file_id: Option<i64>,
+    page_name: &'static str,
+    finished: bool,
+}
+
+impl Iterator for FileMetadataPages<'_> {
+    type Item = Result<Vec<DuckLakeFileMetadata>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let metadata = match self.provider.get_table_file_metadata_page(
+            self.table_id,
+            self.snapshot_id,
+            self.after_data_file_id,
+            FILE_METADATA_BATCH_SIZE,
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            },
+        };
+        if metadata.is_empty() {
+            self.finished = true;
+            return None;
+        }
+        if metadata.len() > FILE_METADATA_BATCH_SIZE {
+            self.finished = true;
+            return Some(Err(crate::DuckLakeError::InvalidConfig(format!(
+                "metadata provider returned {} files for a {}-file {} page",
+                metadata.len(),
+                FILE_METADATA_BATCH_SIZE,
+                self.page_name,
+            ))));
+        }
+
+        let next_after = metadata.last().unwrap().file.data_file_id;
+        if self
+            .after_data_file_id
+            .is_some_and(|after| next_after <= after)
+        {
+            self.finished = true;
+            return Some(Err(crate::DuckLakeError::InvalidConfig(
+                "metadata provider returned a non-advancing file page".to_string(),
+            )));
+        }
+        self.after_data_file_id = Some(next_after);
+        self.finished = metadata.len() < FILE_METADATA_BATCH_SIZE;
+        Some(Ok(metadata))
+    }
+}
+
 /// Build a `PARQUET:field_id` field-metadata map for the given reserved id.
 fn parquet_field_id_metadata(field_id: i32) -> HashMap<String, String> {
     HashMap::from([("PARQUET:field_id".to_string(), field_id.to_string())])
@@ -812,32 +870,8 @@ impl DuckLakeTable {
 
     pub(crate) fn files_with_partitions(&self) -> Result<Vec<DuckLakeTableFile>> {
         let mut files = Vec::new();
-        let mut after_data_file_id = None;
-        loop {
-            let metadata = self.provider.get_table_file_metadata_page(
-                self.table_id,
-                self.snapshot_id,
-                after_data_file_id,
-                FILE_METADATA_BATCH_SIZE,
-            )?;
-            if metadata.is_empty() {
-                break;
-            }
-            if metadata.len() > FILE_METADATA_BATCH_SIZE {
-                return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "metadata provider returned {} files for a {}-file compaction page",
-                    metadata.len(),
-                    FILE_METADATA_BATCH_SIZE
-                )));
-            }
-            let last_page = metadata.len() < FILE_METADATA_BATCH_SIZE;
-            let next_after = metadata.last().unwrap().file.data_file_id;
-            if after_data_file_id.is_some_and(|after| next_after <= after) {
-                return Err(crate::DuckLakeError::InvalidConfig(
-                    "metadata provider returned a non-advancing file page".to_string(),
-                ));
-            }
-            after_data_file_id = Some(next_after);
+        for metadata in self.file_metadata_pages("compaction") {
+            let metadata = metadata?;
             for metadata in metadata {
                 if metadata.file.partition_id.is_some() && metadata.file.partition_values.is_empty()
                 {
@@ -848,13 +882,21 @@ impl DuckLakeTable {
                 }
                 files.push(metadata.file);
             }
-            if last_page {
-                break;
-            }
         }
         #[cfg(feature = "encryption")]
         self.configure_encryption_factory(&files)?;
         Ok(files)
+    }
+
+    fn file_metadata_pages(&self, page_name: &'static str) -> FileMetadataPages<'_> {
+        FileMetadataPages {
+            provider: self.provider.as_ref(),
+            table_id: self.table_id,
+            snapshot_id: self.snapshot_id,
+            after_data_file_id: None,
+            page_name,
+            finished: false,
+        }
     }
 
     /// Resolve a file path (data or delete file) to its absolute path
@@ -917,11 +959,14 @@ impl DuckLakeTable {
     /// Effectiveness note: a file with a live delete file has `Inexact`
     /// statistics (its recorded min/max may cover already-deleted rows). Because
     /// `PrunableStatistics` only prunes on `Exact` bounds, such a file is always
-    /// kept — and, since the bounds are aggregated per column across all files,
-    /// one `Inexact` file suppresses pruning by that column for the whole scan.
-    /// Pruning is therefore most effective on append-only / delete-free files.
+    /// kept. Since bounds are aggregated per column across the current candidate
+    /// files, one `Inexact` file can suppress that column's predicate for the
+    /// current pass. Conjuncts are therefore applied repeatedly: a partition
+    /// predicate can first remove files with missing bounds, then a range
+    /// predicate can prune the remaining files on its next pass. Pruning remains
+    /// most effective on append-only / delete-free files.
     /// Inject partition-derived min/max bounds into per-file statistics so the
-    /// existing pruning path ([`Self::prune_table_files`]) can drop partition files
+    /// existing pruning path ([`Self::prune_table_files_iteratively`]) can drop partition files
     /// that cannot match a predicate on a partition column.
     ///
     /// For each file's `partition_values`, map the value through the active spec to
@@ -1017,44 +1062,53 @@ impl DuckLakeTable {
         }
     }
 
-    fn prune_table_files<'a>(
+    fn prune_table_files_iteratively<'a>(
         &self,
-        pruning: Option<&PruningPredicate>,
+        predicates: &[PruningPredicate],
         table_files: &'a [DuckLakeTableFile],
         file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> Vec<&'a DuckLakeTableFile> {
-        let Some(pruning) = pruning else {
-            return table_files.iter().collect();
-        };
-        match self.file_pruning_mask(pruning, table_files, file_statistics) {
-            Ok(mask) => {
-                debug_assert_eq!(mask.len(), table_files.len());
-                table_files
-                    .iter()
+        let mut retained = table_files.iter().collect::<Vec<_>>();
+        if predicates.is_empty() {
+            return retained;
+        }
+
+        loop {
+            let count_before = retained.len();
+            for predicate in predicates {
+                let mask = match self.file_pruning_mask_for(predicate, &retained, file_statistics) {
+                    Ok(mask) => mask,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "skipping plan-time file pruning");
+                        return table_files.iter().collect();
+                    },
+                };
+                retained = retained
+                    .into_iter()
                     .zip(mask)
-                    .filter_map(|(tf, keep)| keep.then_some(tf))
-                    .collect()
-            },
-            Err(e) => {
-                tracing::debug!(error = %e, "skipping plan-time file pruning");
-                table_files.iter().collect()
-            },
+                    .filter_map(|(file, keep)| keep.then_some(file))
+                    .collect();
+            }
+            if retained.len() == count_before {
+                return retained;
+            }
         }
     }
 
-    fn file_pruning_predicate(
+    fn file_pruning_predicates(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> DataFusionResult<Option<PruningPredicate>> {
-        use datafusion::logical_expr::utils::conjunction;
-
-        let Some(expr) = conjunction(filters.iter().cloned()) else {
-            return Ok(None);
-        };
+    ) -> DataFusionResult<Vec<PruningPredicate>> {
         let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        let predicate = state.create_physical_expr(expr, &df_schema)?;
-        PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema)).map(Some)
+        filters
+            .iter()
+            .flat_map(datafusion::logical_expr::utils::split_conjunction)
+            .map(|expr| {
+                let predicate = state.create_physical_expr(expr.clone(), &df_schema)?;
+                PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema))
+            })
+            .collect()
     }
 
     /// Build a `PruningPredicate` from `filters` and evaluate it against every
@@ -1062,10 +1116,10 @@ impl DuckLakeTable {
     /// `self.table_files` (`true` = keep). Filters and statistics are both keyed
     /// to `physical_schema` (the parquet-backed columns, excluding the synthetic
     /// rowid), matching how `file_statistics` is indexed.
-    fn file_pruning_mask(
+    fn file_pruning_mask_for(
         &self,
         pruning: &PruningPredicate,
-        table_files: &[DuckLakeTableFile],
+        table_files: &[&DuckLakeTableFile],
         file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> DataFusionResult<Vec<bool>> {
         // A file lacking recorded statistics (e.g. written before statistics
@@ -2522,7 +2576,7 @@ impl TableProvider for DuckLakeTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        // Filters drive plan-time file pruning below: `prune_table_files` drops
+        // Filters drive plan-time file pruning below: iterative conjunct pruning drops
         // files whose catalog statistics prove they cannot match. They are also
         // pushed down to the parquet scanner by DataFusion's optimizer for row
         // group / page-level filtering. We declare them Inexact in
@@ -2543,50 +2597,15 @@ impl TableProvider for DuckLakeTable {
         };
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        let pruning = match self.file_pruning_predicate(state, filters) {
+        let pruning = match self.file_pruning_predicates(state, filters) {
             Ok(pruning) => pruning,
             Err(error) => {
                 tracing::debug!(%error, "skipping plan-time file pruning");
-                None
+                Vec::new()
             },
         };
-        let mut after_data_file_id = None;
-        loop {
-            let metadata = self.provider.get_table_file_metadata_page(
-                self.table_id,
-                self.snapshot_id,
-                after_data_file_id,
-                FILE_METADATA_BATCH_SIZE,
-            )?;
-            if metadata.is_empty() {
-                break;
-            }
-            if metadata.len() > FILE_METADATA_BATCH_SIZE {
-                return Err(DataFusionError::External(Box::new(
-                    crate::DuckLakeError::InvalidConfig(format!(
-                        "metadata provider returned {} files for a {}-file planning page",
-                        metadata.len(),
-                        FILE_METADATA_BATCH_SIZE
-                    )),
-                )));
-            }
-            // A short page proves the file list is exhausted (pages are keyed
-            // and ordered by data_file_id under a LIMIT), so stop after
-            // processing it rather than paying one more metadata round trip
-            // for the empty terminator page. For tables with fewer files than
-            // the batch size — the common case — this halves the planning
-            // metadata queries.
-            let last_page = metadata.len() < FILE_METADATA_BATCH_SIZE;
-            let next_after = metadata.last().unwrap().file.data_file_id;
-            if after_data_file_id.is_some_and(|after| next_after <= after) {
-                return Err(DataFusionError::External(Box::new(
-                    crate::DuckLakeError::InvalidConfig(
-                        "metadata provider returned a non-advancing file page".to_string(),
-                    ),
-                )));
-            }
-            after_data_file_id = Some(next_after);
-
+        for metadata in self.file_metadata_pages("planning") {
+            let metadata = metadata.map_err(|error| DataFusionError::External(Box::new(error)))?;
             let mut catalog_file_statistics = Vec::new();
             let mut table_files = Vec::with_capacity(metadata.len());
             for DuckLakeFileMetadata {
@@ -2615,7 +2634,7 @@ impl TableProvider for DuckLakeTable {
             self.configure_encryption_factory(&table_files)?;
 
             let table_files =
-                self.prune_table_files(pruning.as_ref(), &table_files, &file_statistics);
+                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
 
             if rowid_in_proj {
                 let rowid_idx = rowid_idx.unwrap();
@@ -2640,9 +2659,6 @@ impl TableProvider for DuckLakeTable {
                         .await?
                     };
                     execs.push(exec);
-                }
-                if last_page {
-                    break;
                 }
                 continue;
             }
@@ -2687,9 +2703,6 @@ impl TableProvider for DuckLakeTable {
                     self.build_exec_for_partial_file(state, table_file, output_schema)
                         .await?,
                 );
-            }
-            if last_page {
-                break;
             }
         }
 
@@ -3372,10 +3385,7 @@ mod tests {
 
         let state = SessionContext::new().state();
         let filters = [col("id").eq(lit(999_999_i64))];
-        let pruning = table
-            .file_pruning_predicate(&state, &filters)
-            .unwrap()
-            .unwrap();
+        let pruning = table.file_pruning_predicates(&state, &filters).unwrap();
         let mut after = None;
         let mut retained = Vec::new();
         loop {
@@ -3403,7 +3413,7 @@ mod tests {
             );
             retained.extend(
                 table
-                    .prune_table_files(Some(&pruning), &files, &file_statistics)
+                    .prune_table_files_iteratively(&pruning, &files, &file_statistics)
                     .into_iter()
                     .map(|file| file.data_file_id),
             );
