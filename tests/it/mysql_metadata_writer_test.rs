@@ -11,8 +11,9 @@
 
 use datafusion_ducklake::{
     ColumnDef, DataFileInfo, MetadataProvider, MetadataWriter, MySqlMetadataProvider,
-    MySqlMetadataWriter, WriteMode,
+    MySqlMetadataWriter, SnapshotCommitMetadata, WriteMode,
 };
+use sqlx::Row;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::mysql::Mysql;
 
@@ -43,7 +44,7 @@ async fn mysql_writer_roundtrip_write_then_read() {
         .unwrap();
     let file = DataFileInfo::new("data_001.parquet", 1024, 4).with_footer_size(128);
     let committed = writer
-        .register_data_file(
+        .register_data_file_with_commit_metadata(
             setup.table_id,
             "main",
             "users",
@@ -53,6 +54,11 @@ async fn mysql_writer_roundtrip_write_then_read() {
             setup.base_snapshot_id,
             &columns,
             &setup.column_ids,
+            &SnapshotCommitMetadata::new()
+                .with_author("Jane Doe")
+                .with_message("Initial import")
+                .with_extra_info("opaque-import-id"),
+            None,
         )
         .unwrap();
     // First write commits snapshot 1 on a fresh catalog.
@@ -78,6 +84,55 @@ async fn mysql_writer_roundtrip_write_then_read() {
     assert!(
         committed2.snapshot_id > committed.snapshot_id,
         "second commit advances the head"
+    );
+
+    let pool = sqlx::MySqlPool::connect(&conn_str).await.unwrap();
+    let rows = sqlx::query(
+        "SELECT snapshot_id, changes_made, author, commit_message, commit_extra_info
+         FROM ducklake_snapshot_changes
+         ORDER BY snapshot_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let changes = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<i64, _>("snapshot_id").unwrap(),
+                row.try_get::<String, _>("changes_made").unwrap(),
+                row.try_get::<Option<String>, _>("author").unwrap(),
+                row.try_get::<Option<String>, _>("commit_message").unwrap(),
+                row.try_get::<Option<String>, _>("commit_extra_info")
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        vec![
+            (
+                committed.snapshot_id,
+                format!(
+                    "created_schema:\"main\",created_table:\"users\",\
+                     inserted_into_table:{}",
+                    setup.table_id
+                ),
+                Some("Jane Doe".to_string()),
+                Some("Initial import".to_string()),
+                Some("opaque-import-id".to_string()),
+            ),
+            (
+                committed2.snapshot_id,
+                format!(
+                    "created_table:\"empty_t\",inserted_into_table:{}",
+                    setup2.table_id
+                ),
+                None,
+                None,
+                None,
+            ),
+        ],
     );
 
     // --- Read side ---------------------------------------------------------
