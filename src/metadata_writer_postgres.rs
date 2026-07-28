@@ -14,8 +14,8 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
-    validate_name,
+    MetadataWriter, RestoreResult, WriteMode, WriteSetupResult, columns_differ,
+    restored_table_data_changes, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::AssertSqlSafe;
@@ -1191,6 +1191,294 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn restore_table_data_to_snapshot(
+        &self,
+        table_id: i64,
+        source_snapshot_id: i64,
+        expected_base_snapshot_id: i64,
+    ) -> Result<RestoreResult> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            let base = sqlx::query(
+                "SELECT s.snapshot_id, s.schema_version
+                 FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1
+                 ORDER BY s.snapshot_id DESC LIMIT 1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let base_snapshot_id: i64 = base.try_get("snapshot_id")?;
+            let schema_version: i64 = base.try_get("schema_version")?;
+            if base_snapshot_id != expected_base_snapshot_id {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "catalog head changed from snapshot {expected_base_snapshot_id} to \
+                     {base_snapshot_id} before table restore"
+                )));
+            }
+            if source_snapshot_id < 0 || source_snapshot_id >= expected_base_snapshot_id {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "restore source snapshot {source_snapshot_id} must precede catalog head \
+                     {expected_base_snapshot_id}"
+                )));
+            }
+            let source_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_catalog_snapshot_map
+                    WHERE catalog_id = $1 AND snapshot_id = $2
+                 )",
+            )
+            .bind(self.catalog_id)
+            .bind(source_snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !source_exists {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "restore source snapshot {source_snapshot_id} does not belong to catalog {}",
+                    self.catalog_id
+                )));
+            }
+            let table_visible_at_source: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_table
+                    WHERE table_id = $1 AND begin_snapshot <= $2
+                      AND (end_snapshot IS NULL OR $2 < end_snapshot)
+                 )",
+            )
+            .bind(table_id)
+            .bind(source_snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !table_visible_at_source {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "table {table_id} is not visible at snapshot {source_snapshot_id}"
+                )));
+            }
+            let table_visible_at_base: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_table
+                    WHERE table_id = $1 AND begin_snapshot <= $2
+                      AND (end_snapshot IS NULL OR $2 < end_snapshot)
+                 )",
+            )
+            .bind(table_id)
+            .bind(expected_base_snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !table_visible_at_base {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "cannot restore data for table {table_id} because it is not visible at the \
+                     current catalog head"
+                )));
+            }
+            let schema_changed_after_source: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_column
+                    WHERE table_id = $1
+                      AND (begin_snapshot > $2
+                           OR (end_snapshot IS NOT NULL AND end_snapshot > $2))
+                 )",
+            )
+            .bind(table_id)
+            .bind(source_snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema_changed_after_source {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "cannot restore data for table {table_id} from snapshot {source_snapshot_id} \
+                     because its schema changed afterward"
+                )));
+            }
+
+            let source_files = sqlx::query(
+                "SELECT data_file_id, path, path_is_relative, file_size_bytes, footer_size,
+                        encryption_key, record_count, row_id_start, mapping_id, partial_max,
+                        partition_id
+                 FROM ducklake_data_file
+                 WHERE table_id = $1 AND begin_snapshot <= $2
+                   AND (end_snapshot IS NULL OR $2 < end_snapshot)
+                 ORDER BY data_file_id",
+            )
+            .bind(table_id)
+            .bind(source_snapshot_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for source in &source_files {
+                if source.try_get::<Option<i64>, _>("partial_max")?.is_some() {
+                    return Err(crate::DuckLakeError::Unsupported(format!(
+                        "cannot restore data for table {table_id} from snapshot \
+                         {source_snapshot_id} because it contains a partial data file"
+                    )));
+                }
+            }
+            let retired_data_files: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ducklake_data_file
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let snapshot_id: i64 = sqlx::query_scalar(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), $1) RETURNING snapshot_id",
+            )
+            .bind(schema_version)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let mut delete_files_restored = 0;
+            for source in &source_files {
+                let source_data_file_id: i64 = source.try_get("data_file_id")?;
+                let data_file_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes, footer_size,
+                          encryption_key, record_count, row_id_start, mapping_id, begin_snapshot,
+                          end_snapshot, partial_max, partition_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12)
+                     RETURNING data_file_id",
+                )
+                .bind(table_id)
+                .bind(source.try_get::<String, _>("path")?)
+                .bind(source.try_get::<bool, _>("path_is_relative")?)
+                .bind(source.try_get::<i64, _>("file_size_bytes")?)
+                .bind(source.try_get::<Option<i64>, _>("footer_size")?)
+                .bind(source.try_get::<Option<String>, _>("encryption_key")?)
+                .bind(source.try_get::<Option<i64>, _>("record_count")?)
+                .bind(source.try_get::<Option<i64>, _>("row_id_start")?)
+                .bind(source.try_get::<Option<i64>, _>("mapping_id")?)
+                .bind(snapshot_id)
+                .bind(source.try_get::<Option<i64>, _>("partial_max")?)
+                .bind(source.try_get::<Option<i64>, _>("partition_id")?)
+                .fetch_one(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_file_column_stats
+                         (data_file_id, table_id, column_id, column_size_bytes, value_count,
+                          null_count, min_value, max_value, contains_nan, extra_stats)
+                     SELECT $1, table_id, column_id, column_size_bytes, value_count,
+                            null_count, min_value, max_value, contains_nan, extra_stats
+                     FROM ducklake_file_column_stats WHERE data_file_id = $2",
+                )
+                .bind(data_file_id)
+                .bind(source_data_file_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_file_partition_value
+                         (data_file_id, table_id, partition_key_index, partition_value)
+                     SELECT $1, table_id, partition_key_index, partition_value
+                     FROM ducklake_file_partition_value WHERE data_file_id = $2",
+                )
+                .bind(data_file_id)
+                .bind(source_data_file_id)
+                .execute(&mut *tx)
+                .await?;
+
+                let source_delete = sqlx::query(
+                    "SELECT path, path_is_relative, file_size_bytes, footer_size, encryption_key,
+                            delete_count, partial_max
+                     FROM ducklake_delete_file
+                     WHERE data_file_id = $1 AND begin_snapshot <= $2
+                       AND (end_snapshot IS NULL OR $2 < end_snapshot)
+                     ORDER BY begin_snapshot DESC LIMIT 1",
+                )
+                .bind(source_data_file_id)
+                .bind(source_snapshot_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(delete) = source_delete {
+                    if delete.try_get::<Option<i64>, _>("partial_max")?.is_some() {
+                        return Err(crate::DuckLakeError::Unsupported(format!(
+                            "cannot restore data for table {table_id} from snapshot \
+                             {source_snapshot_id} because it contains a partial delete file"
+                        )));
+                    }
+                    sqlx::query(
+                        "INSERT INTO ducklake_delete_file
+                             (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                              footer_size, encryption_key, delete_count, begin_snapshot,
+                              end_snapshot, partial_max)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(delete.try_get::<String, _>("path")?)
+                    .bind(delete.try_get::<bool, _>("path_is_relative")?)
+                    .bind(delete.try_get::<i64, _>("file_size_bytes")?)
+                    .bind(delete.try_get::<Option<i64>, _>("footer_size")?)
+                    .bind(delete.try_get::<Option<String>, _>("encryption_key")?)
+                    .bind(delete.try_get::<Option<i64>, _>("delete_count")?)
+                    .bind(snapshot_id)
+                    .bind(delete.try_get::<Option<i64>, _>("partial_max")?)
+                    .execute(&mut *tx)
+                    .await?;
+                    delete_files_restored += 1;
+                }
+            }
+
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = (
+                         SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file
+                         WHERE table_id = $1 AND end_snapshot IS NULL
+                     ),
+                     file_size_bytes = (
+                         SELECT COALESCE(SUM(file_size_bytes), 0) FROM ducklake_data_file
+                         WHERE table_id = $1 AND end_snapshot IS NULL
+                     )
+                 WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let (columns, column_ids) = live_columns_for_stats(table_id, &mut tx).await?;
+            recompute_table_column_stats(&mut tx, table_id, &columns, &column_ids).await?;
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes
+                     (snapshot_id, changes_made, commit_message)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(snapshot_id)
+            .bind(restored_table_data_changes(
+                table_id,
+                retired_data_files > 0,
+                !source_files.is_empty(),
+            ))
+            .bind("datafusion restore")
+            .execute(&mut *tx)
+            .await?;
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+            tx.commit().await?;
+            Ok(RestoreResult {
+                snapshot_id,
+                data_files_restored: source_files.len(),
+                delete_files_restored,
+            })
         })
     }
 
