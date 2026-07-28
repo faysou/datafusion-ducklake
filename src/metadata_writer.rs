@@ -62,6 +62,21 @@ pub(crate) fn table_write_changes(
     }
 }
 
+pub(crate) fn restored_table_data_changes(
+    table_id: i64,
+    retired_data: bool,
+    restored_data: bool,
+) -> String {
+    match (retired_data, restored_data) {
+        (true, true) => {
+            format!("deleted_from_table:{table_id},inserted_into_table:{table_id}")
+        },
+        (true, false) => format!("deleted_from_table:{table_id}"),
+        (false, true) => format!("inserted_into_table:{table_id}"),
+        (false, false) => String::new(),
+    }
+}
+
 pub(crate) fn quote_snapshot_name(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -667,6 +682,17 @@ pub struct WriteResult {
     pub records_written: i64,
 }
 
+/// Result of restoring one table's data to an earlier snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreResult {
+    /// New catalog snapshot containing the restored table state.
+    pub snapshot_id: i64,
+    /// Number of data-file metadata rows re-referenced by the restored state.
+    pub data_files_restored: usize,
+    /// Number of delete-file metadata rows re-referenced by the restored state.
+    pub delete_files_restored: usize,
+}
+
 /// The ids actually committed by `register_data_file` / `publish_snapshot`.
 ///
 /// On multicatalog Postgres all metadata is written at the commit point, so the
@@ -714,6 +740,29 @@ pub struct WriteSetupResult {
 pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;
+
+    /// Restore one table's data state from `source_snapshot_id` in a new snapshot.
+    ///
+    /// Implementations must allocate fresh data/delete-file identifiers while re-referencing the
+    /// same physical objects, preserve row lineage, retire the current file generation, and abort
+    /// if the catalog head differs from `expected_base_snapshot_id`. Existing snapshots retain
+    /// their original meaning.
+    ///
+    /// This metadata-only operation does not restore table schemas. Implementations must reject a
+    /// source snapshot when the table schema changed afterward. They must also reject partial data
+    /// or delete files because those files embed source snapshot identifiers that cannot be
+    /// retargeted through metadata alone.
+    fn restore_table_data_to_snapshot(
+        &self,
+        _table_id: i64,
+        _source_snapshot_id: i64,
+        _expected_base_snapshot_id: i64,
+        _commit_metadata: &SnapshotCommitMetadata,
+    ) -> Result<RestoreResult> {
+        Err(DuckLakeError::Unsupported(
+            "table data restore is not supported on this metadata backend".to_string(),
+        ))
+    }
 
     /// Get or create a schema, returning `(schema_id, was_created)`.
     fn get_or_create_schema(
