@@ -220,6 +220,243 @@ async fn postgres_writes_record_snapshot_changes_and_commit_metadata() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_restore_references_source_files_with_new_ids() {
+    use datafusion_ducklake::{
+        DeleteFileInfo,
+        maintenance::{CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog},
+    };
+    use object_store::{ObjectStore, local::LocalFileSystem};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("restore").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let columns = cols();
+    let first_setup = writer
+        .begin_write_transaction("public", "events", &columns, WriteMode::Replace)
+        .unwrap();
+    let first = writer
+        .register_data_file(
+            first_setup.table_id,
+            "public",
+            "events",
+            first_setup.snapshot_id,
+            &DataFileInfo::new("first.parquet", 100, 10).with_footer_size(17),
+            WriteMode::Replace,
+            first_setup.base_snapshot_id,
+            &columns,
+            &first_setup.column_ids,
+        )
+        .unwrap();
+    let source_data_file_id: i64 = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_data_file
+         WHERE table_id = $1 AND path = 'first.parquet'",
+    )
+    .bind(first.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = writer
+        .set_delete_file(
+            first.table_id,
+            "public",
+            "events",
+            first.snapshot_id + 1,
+            source_data_file_id,
+            None,
+            first.snapshot_id,
+            &DeleteFileInfo::new("first-deletes.parquet", 20, 2).with_footer_size(7),
+        )
+        .unwrap();
+    let source_delete_file_id: i64 = sqlx::query_scalar(
+        "SELECT delete_file_id FROM ducklake_delete_file
+         WHERE data_file_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(source_data_file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let second_setup = writer
+        .begin_write_transaction("public", "events", &columns, WriteMode::Append)
+        .unwrap();
+    let second = writer
+        .register_data_file(
+            first.table_id,
+            "public",
+            "events",
+            second_setup.snapshot_id,
+            &DataFileInfo::new("second.parquet", 200, 20),
+            WriteMode::Append,
+            second_setup.base_snapshot_id,
+            &columns,
+            &second_setup.column_ids,
+        )
+        .unwrap();
+
+    let restored = writer
+        .restore_table_data_to_snapshot(
+            first.table_id,
+            delete.snapshot_id,
+            second.snapshot_id,
+            &SnapshotCommitMetadata::new()
+                .with_author("restore-test")
+                .with_message("restore source state")
+                .with_extra_info("restore-id=7"),
+        )
+        .unwrap();
+    let live_data = sqlx::query(
+        "SELECT data_file_id, path, file_size_bytes, footer_size, record_count, row_id_start
+         FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(first.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let restored_data_file_id = live_data[0].try_get::<i64, _>("data_file_id").unwrap();
+    let live_delete = sqlx::query(
+        "SELECT delete_file_id, data_file_id, path, file_size_bytes, footer_size, delete_count
+         FROM ducklake_delete_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(first.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let snapshot_change =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+            "SELECT changes_made, author, commit_message, commit_extra_info
+         FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(restored.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(current_head(&pool, catalog_id).await, restored.snapshot_id);
+    assert!(restored.snapshot_id > second.snapshot_id);
+    assert_eq!(restored.data_files_restored, 1);
+    assert_eq!(restored.delete_files_restored, 1);
+    assert_eq!(live_data.len(), 1);
+    assert!(restored_data_file_id > source_data_file_id);
+    assert_eq!(
+        (
+            live_data[0].try_get::<String, _>("path").unwrap(),
+            live_data[0].try_get::<i64, _>("file_size_bytes").unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("footer_size")
+                .unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("record_count")
+                .unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("row_id_start")
+                .unwrap(),
+        ),
+        (
+            "first.parquet".to_string(),
+            100,
+            Some(17),
+            Some(10),
+            Some(0)
+        ),
+    );
+    let restored_delete_file_id = live_delete.try_get::<i64, _>("delete_file_id").unwrap();
+    assert!(restored_delete_file_id > source_delete_file_id);
+    assert_eq!(
+        (
+            live_delete.try_get::<i64, _>("data_file_id").unwrap(),
+            live_delete.try_get::<String, _>("path").unwrap(),
+            live_delete.try_get::<i64, _>("file_size_bytes").unwrap(),
+            live_delete
+                .try_get::<Option<i64>, _>("footer_size")
+                .unwrap(),
+            live_delete
+                .try_get::<Option<i64>, _>("delete_count")
+                .unwrap(),
+        ),
+        (
+            restored_data_file_id,
+            "first-deletes.parquet".to_string(),
+            20,
+            Some(7),
+            Some(2),
+        ),
+    );
+    assert_eq!(
+        snapshot_change,
+        (
+            format!(
+                "deleted_from_table:{},inserted_into_table:{}",
+                first.table_id, first.table_id
+            ),
+            Some("restore-test".to_string()),
+            Some("restore source state".to_string()),
+            Some("restore-id=7".to_string()),
+        ),
+    );
+
+    let expired = manager
+        .expire_snapshots_in_catalog(
+            "restore",
+            ExpireCriteria::Versions(vec![
+                first.snapshot_id,
+                delete.snapshot_id,
+                second.snapshot_id,
+            ]),
+        )
+        .await
+        .unwrap();
+    let scheduled = sqlx::query_scalar::<_, String>(
+        "SELECT path FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1
+         ORDER BY path",
+    )
+    .bind(catalog_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        expired
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![first.snapshot_id, delete.snapshot_id, second.snapshot_id,],
+    );
+    assert_eq!(
+        scheduled,
+        vec![
+            "cat_1/public/events/first-deletes.parquet",
+            "cat_1/public/events/first.parquet",
+            "cat_1/public/events/second.parquet",
+        ],
+    );
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let cleanup =
+        cleanup_old_files_in_catalog(&manager, "restore", store, CleanupCriteria::All, true)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        cleanup,
+        vec![
+            data_path
+                .join("cat_1/public/events/second.parquet")
+                .to_string_lossy()
+                .to_string()
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn postgres_fileless_and_partition_ddl_record_snapshot_changes() {
     let (pool, _container) = spin_up_postgres().await.unwrap();
     let catalog_id = MulticatalogManager::new(pool.clone())

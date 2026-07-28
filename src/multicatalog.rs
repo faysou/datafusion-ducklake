@@ -11,6 +11,7 @@ use crate::metadata_writer_postgres::execute_ddl_statements;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
+use std::collections::HashSet;
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
 /// root (file → table → schema → data_path). An absolute path anywhere in the chain
@@ -773,6 +774,24 @@ impl MulticatalogManager {
                 .await?
             },
         };
+        let referenced_query = format!(
+            "SELECT {PG_RESOLVED_PATH} AS path, {PG_REL_FLAG} AS path_is_relative
+             FROM ducklake_data_file df
+             JOIN ducklake_table t ON t.table_id = df.table_id
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             UNION
+             SELECT {PG_RESOLVED_PATH} AS path, {PG_REL_FLAG} AS path_is_relative
+             FROM ducklake_delete_file df
+             JOIN ducklake_table t ON t.table_id = df.table_id
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id"
+        );
+        let referenced: HashSet<(String, bool)> = sqlx::query(AssertSqlSafe(referenced_query))
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+            .collect::<Result<_>>()?;
+
         rows.into_iter()
             .map(|r| {
                 Ok(ScheduledFile {
@@ -781,7 +800,15 @@ impl MulticatalogManager {
                     path_is_relative: r.try_get(2)?,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .map(|files| {
+                files
+                    .into_iter()
+                    .filter(|file| {
+                        !referenced.contains(&(file.path.clone(), file.path_is_relative))
+                    })
+                    .collect()
+            })
     }
 
     /// Remove scheduled-deletion bookkeeping rows for `catalog_name` after their objects
