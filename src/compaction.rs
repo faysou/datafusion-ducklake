@@ -380,6 +380,7 @@ impl DuckLakeTable {
             .object_store(self.object_store_url().as_ref())?;
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
         let column_ids = self.column_ids();
+        let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
 
         // Apply the table's live sort order to each merged file (mirroring official
@@ -478,8 +479,11 @@ impl DuckLakeTable {
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
             let subpath = partition_id.map(|pid| {
-                let names =
-                    self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
+                let names = self.partition_path_names(
+                    live_partition_spec.as_ref(),
+                    pid,
+                    &top_level_column_ids,
+                );
                 crate::partition::hive_subpath(&names, &partition_values)
             });
             let file = table_writer
@@ -559,6 +563,7 @@ impl DuckLakeTable {
             .object_store(self.object_store_url().as_ref())?;
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
         let column_ids = self.column_ids();
+        let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
 
         // Re-apply the table's live sort order to each rewritten file so its rows
@@ -620,8 +625,11 @@ impl DuckLakeTable {
                 // partition: inherit the identity and the Hive directory.
                 let (partition_id, partition_values) = partition_key(tf);
                 let subpath = partition_id.map(|pid| {
-                    let names =
-                        self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
                     crate::partition::hive_subpath(&names, &partition_values)
                 });
                 let file = table_writer

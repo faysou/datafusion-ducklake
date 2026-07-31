@@ -2218,7 +2218,17 @@ impl DuckLakeTable {
     /// to the catalog on read.
     #[cfg(feature = "write")]
     pub(crate) fn column_ids(&self) -> Vec<i64> {
-        self.columns.iter().map(|c| c.column_id).collect()
+        let mut ids = Vec::new();
+        for column in &self.columns {
+            ids.push(column.column_id);
+            ids.extend_from_slice(&column.nested_column_ids);
+        }
+        ids
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn top_level_column_ids(&self) -> Vec<i64> {
+        self.columns.iter().map(|column| column.column_id).collect()
     }
 
     /// Whether `file` carries a data column that is no longer in the table's
