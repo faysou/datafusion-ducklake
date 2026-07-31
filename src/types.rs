@@ -6,11 +6,80 @@ use std::sync::Arc;
 use crate::metadata_provider::DuckLakeTableColumn;
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
-use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::{Result as DataFusionResult, ScalarValue};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{self, Column};
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapter, PhysicalExprAdapter, PhysicalExprAdapterFactory,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
 
 pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
+
+const INITIAL_DEFAULT_METADATA_KEY: &str = "ducklake.initial_default";
+
+#[derive(Debug)]
+pub(crate) struct DuckLakeDefaultExprAdapterFactory;
+
+impl PhysicalExprAdapterFactory for DuckLakeDefaultExprAdapterFactory {
+    fn create(
+        &self,
+        logical_file_schema: Arc<Schema>,
+        physical_file_schema: Arc<Schema>,
+    ) -> DataFusionResult<Arc<dyn PhysicalExprAdapter>> {
+        Ok(Arc::new(DuckLakeDefaultExprAdapter {
+            fallback: DefaultPhysicalExprAdapter::new(
+                Arc::clone(&logical_file_schema),
+                Arc::clone(&physical_file_schema),
+            ),
+            logical_file_schema,
+            physical_file_schema,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct DuckLakeDefaultExprAdapter {
+    fallback: DefaultPhysicalExprAdapter,
+    logical_file_schema: Arc<Schema>,
+    physical_file_schema: Arc<Schema>,
+}
+
+impl PhysicalExprAdapter for DuckLakeDefaultExprAdapter {
+    fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let rewritten = expr
+            .transform(|expr| {
+                let Some(column) = expr.downcast_ref::<Column>() else {
+                    return Ok(Transformed::no(expr));
+                };
+                if self
+                    .physical_file_schema
+                    .field_with_name(column.name())
+                    .is_ok()
+                {
+                    return Ok(Transformed::no(expr));
+                }
+                let Ok(field) = self.logical_file_schema.field_with_name(column.name()) else {
+                    return Ok(Transformed::no(expr));
+                };
+                let Some(value) = field.metadata().get(INITIAL_DEFAULT_METADATA_KEY) else {
+                    return Ok(Transformed::no(expr));
+                };
+                let scalar = parse_ducklake_scalar(value, field.data_type()).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "Cannot decode initial_default '{value}' for column '{}' as {}",
+                        column.name(),
+                        field.data_type()
+                    ))
+                })?;
+                Ok(Transformed::yes(expressions::lit(scalar)))
+            })
+            .data()?;
+        self.fallback.rewrite(rewritten)
+    }
+}
 
 pub(crate) fn parse_ducklake_scalar(value: &str, data_type: &DataType) -> Option<ScalarValue> {
     match data_type {
@@ -1032,14 +1101,21 @@ pub fn build_read_schema_with_field_id_mapping(
                 name_mapping.insert(read_name.clone(), col.column_name.clone());
             }
 
-            // An absent column is materialised as a null array by the scan, so its
-            // read field must be nullable; the catalog nullability is still
-            // enforced on output by ColumnRenameExec.
-            Ok(Field::new(
+            // Without an initial default, an absent column is materialised as a
+            // null array, so its read field must be nullable. ColumnRenameExec
+            // still enforces the catalog nullability on output.
+            let mut field = Field::new(
                 read_name,
                 data_type,
-                col.is_nullable || is_absent,
-            ))
+                col.is_nullable || (is_absent && col.initial_default.is_none()),
+            );
+            if is_absent && let Some(initial_default) = &col.initial_default {
+                field = field.with_metadata(HashMap::from([(
+                    INITIAL_DEFAULT_METADATA_KEY.to_string(),
+                    initial_default.clone(),
+                )]));
+            }
+            Ok(field)
         })
         .collect();
 
@@ -1054,22 +1130,18 @@ mod tests {
     fn test_build_read_schema_with_renamed_columns() {
         // Simulate: column was originally named "user_id", now renamed to "userId"
         let current_columns = vec![
-            DuckLakeTableColumn {
-                column_id: 1,
-                column_name: "userId".to_string(), // Current name (renamed)
-                column_type: "int32".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
-            DuckLakeTableColumn {
-                column_id: 2,
-                column_name: "name".to_string(), // Not renamed
-                column_type: "varchar".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
+            DuckLakeTableColumn::new(
+                1,
+                "userId".to_string(), // Current name (renamed)
+                "int32".to_string(),
+                true,
+            ),
+            DuckLakeTableColumn::new(
+                2,
+                "name".to_string(), // Not renamed
+                "varchar".to_string(),
+                true,
+            ),
         ];
 
         // Parquet file has original names
@@ -1092,14 +1164,8 @@ mod tests {
 
     #[test]
     fn test_build_read_schema_no_rename_needed() {
-        let current_columns = vec![DuckLakeTableColumn {
-            column_id: 1,
-            column_name: "id".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-            data_type: None,
-            nested_column_ids: Vec::new(),
-        }];
+        let current_columns =
+            vec![DuckLakeTableColumn::new(1, "id".to_string(), "int32".to_string(), true)];
 
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(1, "id".to_string()); // Same name
@@ -1115,14 +1181,8 @@ mod tests {
     #[test]
     fn test_build_read_schema_no_field_ids() {
         // External file without field_ids
-        let current_columns = vec![DuckLakeTableColumn {
-            column_id: 1,
-            column_name: "id".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-            data_type: None,
-            nested_column_ids: Vec::new(),
-        }];
+        let current_columns =
+            vec![DuckLakeTableColumn::new(1, "id".to_string(), "int32".to_string(), true)];
 
         let parquet_field_ids = HashMap::new(); // No field_ids in Parquet
 
@@ -1142,22 +1202,8 @@ mod tests {
         // carries a column literally named "tag" (the dropped one, different
         // field_id), which must NOT be aliased.
         let current_columns = vec![
-            DuckLakeTableColumn {
-                column_id: 1,
-                column_name: "id".to_string(),
-                column_type: "int32".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
-            DuckLakeTableColumn {
-                column_id: 2,
-                column_name: "tag".to_string(),
-                column_type: "varchar".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
+            DuckLakeTableColumn::new(1, "id".to_string(), "int32".to_string(), true),
+            DuckLakeTableColumn::new(2, "tag".to_string(), "varchar".to_string(), true),
         ];
 
         let mut parquet_field_ids = HashMap::new();
@@ -1201,6 +1247,10 @@ mod tests {
                 .into(),
             )),
             nested_column_ids: vec![2, 3, 4],
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }];
         let parquet_field_ids = HashMap::from([
             (1, "payload".to_string()),
@@ -1257,6 +1307,10 @@ mod tests {
                 vec![Arc::new(Field::new("c", DataType::Int32, true))].into(),
             )),
             nested_column_ids: vec![4],
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }];
         let parquet_field_ids = HashMap::from([(1, "payload".to_string()), (3, "c".to_string())]);
         let id_metadata =
@@ -1340,6 +1394,10 @@ mod tests {
                     true,
                 )))),
                 nested_column_ids: vec![2],
+                initial_default: None,
+                default_value: None,
+                default_value_type: None,
+                default_value_dialect: None,
             },
             DuckLakeTableColumn {
                 column_id: 3,
@@ -1354,6 +1412,10 @@ mod tests {
                     .into(),
                 )),
                 nested_column_ids: vec![4, 5],
+                initial_default: None,
+                default_value: None,
+                default_value_type: None,
+                default_value_dialect: None,
             },
             DuckLakeTableColumn {
                 column_id: 6,
@@ -1375,6 +1437,10 @@ mod tests {
                     false,
                 )),
                 nested_column_ids: vec![7, 8],
+                initial_default: None,
+                default_value: None,
+                default_value_type: None,
+                default_value_dialect: None,
             },
             DuckLakeTableColumn {
                 column_id: 9,
@@ -1387,6 +1453,10 @@ mod tests {
                     true,
                 )))),
                 nested_column_ids: vec![10, 11],
+                initial_default: None,
+                default_value: None,
+                default_value_type: None,
+                default_value_dialect: None,
             },
         ]
     }
@@ -1528,6 +1598,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ducklake_primitive_literals_decode_exactly() {
+        let cases = vec![
+            ("boolean", "1", ScalarValue::Boolean(Some(true))),
+            ("int8", "-8", ScalarValue::Int8(Some(-8))),
+            ("int16", "-1600", ScalarValue::Int16(Some(-1600))),
+            ("int32", "-3200", ScalarValue::Int32(Some(-3200))),
+            ("int64", "-6400", ScalarValue::Int64(Some(-6400))),
+            ("uint8", "8", ScalarValue::UInt8(Some(8))),
+            ("uint16", "1600", ScalarValue::UInt16(Some(1600))),
+            ("uint32", "3200", ScalarValue::UInt32(Some(3200))),
+            ("uint64", "6400", ScalarValue::UInt64(Some(6400))),
+            ("float32", "3.5", ScalarValue::Float32(Some(3.5))),
+            ("float64", "7.25", ScalarValue::Float64(Some(7.25))),
+            (
+                "decimal(10,2)",
+                "123.45",
+                ScalarValue::Decimal128(Some(12_345), 10, 2),
+            ),
+            (
+                "time",
+                "00:00:01.000002",
+                ScalarValue::Time64Microsecond(Some(1_000_002)),
+            ),
+            ("date", "1970-01-02", ScalarValue::Date32(Some(1))),
+            (
+                "timestamp",
+                "1970-01-01 00:00:01.000002",
+                ScalarValue::TimestampMicrosecond(Some(1_000_002), None),
+            ),
+            (
+                "timestamptz",
+                "1970-01-01 00:00:01.000002+00",
+                ScalarValue::TimestampMicrosecond(Some(1_000_002), Some("UTC".into())),
+            ),
+            (
+                "timestamp_s",
+                "1970-01-01 00:00:01",
+                ScalarValue::TimestampSecond(Some(1), None),
+            ),
+            (
+                "timestamp_ms",
+                "1970-01-01 00:00:00.001",
+                ScalarValue::TimestampMillisecond(Some(1), None),
+            ),
+            (
+                "timestamp_ns",
+                "1970-01-01 00:00:00.000000001",
+                ScalarValue::TimestampNanosecond(Some(1), None),
+            ),
+            (
+                "interval",
+                "1 month 2 days 3 seconds",
+                ScalarValue::new_interval_mdn(1, 2, 3_000_000_000),
+            ),
+            (
+                "varchar",
+                "hello",
+                ScalarValue::Utf8View(Some("hello".to_string())),
+            ),
+            (
+                "json",
+                r#"{"key":"value"}"#,
+                ScalarValue::Utf8View(Some(r#"{"key":"value"}"#.to_string())),
+            ),
+            (
+                "blob",
+                r"\x68656C6C6F",
+                ScalarValue::BinaryView(Some(b"hello".to_vec())),
+            ),
+            (
+                "uuid",
+                "550e8400-e29b-41d4-a716-446655440000",
+                ScalarValue::FixedSizeBinary(
+                    16,
+                    Some(vec![
+                        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66,
+                        0x55, 0x44, 0x00, 0x00,
+                    ]),
+                ),
+            ),
+            (
+                "timetz",
+                "12:30:00+02",
+                ScalarValue::Utf8View(Some("12:30:00+02".to_string())),
+            ),
+        ];
+
+        for (ducklake_type, encoded, expected) in cases {
+            let data_type = ducklake_to_arrow_type(ducklake_type).unwrap();
+            assert_eq!(
+                parse_ducklake_scalar(encoded, &data_type),
+                Some(expected),
+                "DuckLake {ducklake_type} literal {encoded}"
+            );
+        }
+    }
+
     /// An external / legacy file whose nested nodes carry no field ids is matched
     /// structurally. Declaring ids the file does not have would be the same
     /// divergence in the opposite direction, so nothing is stamped.
@@ -1618,6 +1786,25 @@ mod tests {
         let error = ducklake_to_arrow_type(&nested).unwrap_err();
 
         assert!(error.to_string().contains("maximum nesting depth"));
+    }
+
+    #[test]
+    fn ducklake_primitive_literals_reject_invalid_encodings() {
+        for (ducklake_type, encoded) in [
+            ("boolean", "yes"),
+            ("int32", "3.5"),
+            ("uint8", "256"),
+            ("date", "not-a-date"),
+            ("blob", "ABC"),
+            ("uuid", "550e8400-e29b-41d4-a716"),
+        ] {
+            let data_type = ducklake_to_arrow_type(ducklake_type).unwrap();
+            assert_eq!(
+                parse_ducklake_scalar(encoded, &data_type),
+                None,
+                "DuckLake {ducklake_type} literal {encoded} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2239,22 +2426,8 @@ mod tests {
     #[test]
     fn test_build_schema_with_list_type() {
         let columns = vec![
-            DuckLakeTableColumn {
-                column_id: 1,
-                column_name: "id".to_string(),
-                column_type: "int32".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
-            DuckLakeTableColumn {
-                column_id: 2,
-                column_name: "tags".to_string(),
-                column_type: "list<varchar>".to_string(),
-                is_nullable: true,
-                data_type: None,
-                nested_column_ids: Vec::new(),
-            },
+            DuckLakeTableColumn::new(1, "id".to_string(), "int32".to_string(), true),
+            DuckLakeTableColumn::new(2, "tags".to_string(), "list<varchar>".to_string(), true),
         ];
 
         let schema = build_arrow_schema(&columns).unwrap();
@@ -2267,16 +2440,12 @@ mod tests {
 
     #[test]
     fn test_build_schema_with_struct_type() {
-        let columns = vec![DuckLakeTableColumn {
-            column_id: 1,
-            column_name: "data".to_string(),
-            column_type: "struct<a:int32>".to_string(),
-            is_nullable: true,
-            data_type: Some(DataType::Struct(
-                vec![Arc::new(Field::new("a", DataType::Int32, false))].into(),
-            )),
-            nested_column_ids: Vec::new(),
-        }];
+        let columns = vec![DuckLakeTableColumn::new(
+            1,
+            "data".to_string(),
+            "struct<a:int32>".to_string(),
+            true,
+        )];
 
         let schema = build_arrow_schema(&columns).unwrap();
         assert_eq!(
@@ -2287,14 +2456,12 @@ mod tests {
 
     #[test]
     fn test_column_id_i32_max_succeeds() {
-        let columns = vec![DuckLakeTableColumn {
-            column_id: i32::MAX as i64,
-            column_name: "id".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-            data_type: None,
-            nested_column_ids: Vec::new(),
-        }];
+        let columns = vec![DuckLakeTableColumn::new(
+            i32::MAX as i64,
+            "id".to_string(),
+            "int32".to_string(),
+            true,
+        )];
 
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(i32::MAX, "id".to_string());
@@ -2305,14 +2472,12 @@ mod tests {
 
     #[test]
     fn test_column_id_overflow_returns_error() {
-        let columns = vec![DuckLakeTableColumn {
-            column_id: i32::MAX as i64 + 1, // 2147483648, exceeds i32 range
-            column_name: "id".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-            data_type: None,
-            nested_column_ids: Vec::new(),
-        }];
+        let columns = vec![DuckLakeTableColumn::new(
+            i32::MAX as i64 + 1, // 2147483648, exceeds i32 range
+            "id".to_string(),
+            "int32".to_string(),
+            true,
+        )];
 
         let parquet_field_ids = HashMap::new();
 
@@ -2337,14 +2502,8 @@ mod tests {
 
     #[test]
     fn test_column_id_negative_within_i32_range_succeeds() {
-        let columns = vec![DuckLakeTableColumn {
-            column_id: -1,
-            column_name: "id".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-            data_type: None,
-            nested_column_ids: Vec::new(),
-        }];
+        let columns =
+            vec![DuckLakeTableColumn::new(-1, "id".to_string(), "int32".to_string(), true)];
 
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(-1_i32, "id".to_string());
@@ -2618,6 +2777,10 @@ mod tests {
                 .into(),
             )),
             nested_column_ids: vec![2, 3],
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }];
         let parquet_field_ids =
             HashMap::from([(1, "s".to_string()), (2, "a".to_string()), (3, "b".to_string())]);
@@ -2664,6 +2827,10 @@ mod tests {
             is_nullable: true,
             data_type: Some(DataType::Map(Arc::new(entries), false)),
             nested_column_ids: vec![2, 3],
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }];
         let parquet_field_ids =
             HashMap::from([(1, "m".to_string()), (2, "key".to_string()), (3, "value".to_string())]);

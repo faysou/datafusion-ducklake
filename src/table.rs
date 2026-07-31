@@ -21,8 +21,8 @@ use crate::row_id::{
 };
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::types::{
-    build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
-    parse_ducklake_scalar,
+    DuckLakeDefaultExprAdapterFactory, build_arrow_schema, build_read_schema_with_field_id_mapping,
+    ducklake_to_arrow_type, extract_parquet_field_ids, parse_ducklake_scalar,
 };
 
 #[cfg(feature = "write")]
@@ -54,7 +54,9 @@ use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
+};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -243,6 +245,51 @@ fn parse_statistic_scalar(
         );
     }
     parsed
+}
+
+fn validate_column_defaults(columns: &[DuckLakeTableColumn]) -> Result<HashMap<String, Expr>> {
+    let mut defaults = HashMap::new();
+    for column in columns {
+        let has_default = column.initial_default.is_some() || column.default_value.is_some();
+        if has_default {
+            match column.default_value_type.as_deref() {
+                None | Some("literal") => {},
+                Some("expression") => {
+                    let dialect = column.default_value_dialect.as_deref().unwrap_or("unknown");
+                    return Err(crate::DuckLakeError::Unsupported(format!(
+                        "Default expression for column '{}' uses dialect '{dialect}'; only literal defaults are supported",
+                        column.column_name
+                    )));
+                },
+                Some(value_type) => {
+                    return Err(crate::DuckLakeError::Unsupported(format!(
+                        "Default value type '{value_type}' for column '{}' is not supported",
+                        column.column_name
+                    )));
+                },
+            }
+        }
+
+        let data_type = ducklake_to_arrow_type(&column.column_type)?;
+        if let Some(value) = &column.initial_default
+            && parse_ducklake_scalar(value, &data_type).is_none()
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "Cannot decode initial_default '{value}' for column '{}' as {}",
+                column.column_name, data_type
+            )));
+        }
+        if let Some(value) = &column.default_value {
+            let scalar = parse_ducklake_scalar(value, &data_type).ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "Cannot decode default_value '{value}' for column '{}' as {}",
+                    column.column_name, data_type
+                ))
+            })?;
+            defaults.insert(column.column_name.clone(), Expr::Literal(scalar, None));
+        }
+    }
+    Ok(defaults)
 }
 
 /// Whether a stored float `max_value` is a usable upper bound.
@@ -873,6 +920,8 @@ pub struct DuckLakeTable {
     row_lineage: bool,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
+    /// Literal defaults used by DataFusion when an INSERT omits a column
+    column_defaults: HashMap<String, Expr>,
     /// Table-level statistics for the physical schema.
     table_statistics: Statistics,
     /// The table's active partition spec at `snapshot_id`, if any. Loaded once at
@@ -927,6 +976,7 @@ impl DuckLakeTable {
         // File metadata is deliberately deferred until scan(), where it can be
         // consumed and pruned in bounded pages.
         let columns = provider.get_table_structure(table_id, snapshot_id)?;
+        let column_defaults = validate_column_defaults(&columns)?;
         // Active partition spec (if any) for pruning. Loaded once at the bound
         // snapshot; `None` for unpartitioned tables or catalogs without partitions.
         let partition_spec = provider.get_partition_spec(table_id, snapshot_id)?;
@@ -961,6 +1011,7 @@ impl DuckLakeTable {
             physical_schema,
             row_lineage: false,
             columns,
+            column_defaults,
             table_statistics,
             partition_spec,
             #[cfg(feature = "encryption")]
@@ -1451,6 +1502,11 @@ impl DuckLakeTable {
         ParquetSource::new(schema)
     }
 
+    fn scan_config_builder(&self, source: Arc<dyn FileSource>) -> FileScanConfigBuilder {
+        FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+            .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
+    }
+
     /// Add each file's decryption key — and that of its live delete file — to
     /// `builder`, resolving paths the same way the readers do. Separate from
     /// installation so a caller reading the catalog in pages can accumulate keys
@@ -1624,7 +1680,7 @@ impl DuckLakeTable {
         // not needed to evaluate the predicate or read positions.
         let physical_proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
         let scan = DataSourceExec::from_data_source(
-            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+            self.scan_config_builder(source)
                 .with_file_groups(file_groups)
                 .with_partitioned_by_file_group(true)
                 .with_projection_indices(Some(physical_proj))?
@@ -1825,12 +1881,10 @@ impl DuckLakeTable {
         // group to the catalog schema (renamed columns or a differing Arrow type).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
         for ((read_schema, name_mapping), partitioned_files) in groups {
-            let mut builder = FileScanConfigBuilder::new(
-                self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(read_schema.clone())),
-            )
-            .with_limit(limit)
-            .with_file_group(FileGroup::new(partitioned_files));
+            let mut builder = self
+                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .with_limit(limit)
+                .with_file_group(FileGroup::new(partitioned_files));
 
             if let Some(proj) = projection {
                 builder = builder.with_projection_indices(Some(proj.clone()))?;
@@ -1972,14 +2026,14 @@ impl DuckLakeTable {
             let source = PositionalFileSource::wrap(Arc::new(
                 self.create_parquet_source(file_cfg.read_schema.clone()),
             ));
-            let mut builder =
-                FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups)
-                    // FileRowNumberExec seeds row positions from the scan
-                    // partition index, so each partition must read exactly
-                    // its configured row-group chunk. DF 54's shared work
-                    // queue can otherwise let sibling partitions steal chunks.
-                    .with_partitioned_by_file_group(true);
+            let mut builder = self
+                .scan_config_builder(source)
+                .with_file_groups(file_groups)
+                // FileRowNumberExec seeds row positions from the scan
+                // partition index, so each partition must read exactly
+                // its configured row-group chunk. DF 54's shared work
+                // queue can otherwise let sibling partitions steal chunks.
+                .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -1997,12 +2051,12 @@ impl DuckLakeTable {
                 file_cfg.embedded_rowid_parquet_name.is_some(),
                 file_statistics,
             )?;
-            let mut builder = FileScanConfigBuilder::new(
-                self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
-            )
-            .with_limit(limit)
-            .with_file_group(FileGroup::new(vec![pf]));
+            let mut builder = self
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                ))
+                .with_limit(limit)
+                .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
             DataSourceExec::from_data_source(builder.build())
         };
@@ -2251,14 +2305,14 @@ impl DuckLakeTable {
             let source = PositionalFileSource::wrap(Arc::new(
                 self.create_parquet_source(file_cfg.read_schema.clone()),
             ));
-            let mut builder =
-                FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups)
-                    // FileRowNumberExec seeds row positions from the scan
-                    // partition index, so each partition must read exactly
-                    // its configured row-group chunk. DF 54's shared work
-                    // queue can otherwise let sibling partitions steal chunks.
-                    .with_partitioned_by_file_group(true);
+            let mut builder = self
+                .scan_config_builder(source)
+                .with_file_groups(file_groups)
+                // FileRowNumberExec seeds row positions from the scan
+                // partition index, so each partition must read exactly
+                // its configured row-group chunk. DF 54's shared work
+                // queue can otherwise let sibling partitions steal chunks.
+                .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(parquet_projection))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -2281,12 +2335,12 @@ impl DuckLakeTable {
             // Embedded rowid, no deletes: legacy plain scan (cardinality-
             // preserving). Keep scan-level limit and reader pruning.
             let pf = self.partitioned_data_file(table_file, true, file_statistics)?;
-            let mut builder = FileScanConfigBuilder::new(
-                self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
-            )
-            .with_limit(limit)
-            .with_file_group(FileGroup::new(vec![pf]));
+            let mut builder = self
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                ))
+                .with_limit(limit)
+                .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(parquet_projection))?;
             DataSourceExec::from_data_source(builder.build())
         };
@@ -2415,12 +2469,10 @@ impl DuckLakeTable {
         {
             pf = pf.with_metadata_size_hint(hint);
         }
-        let builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(read_schema.clone())),
-        )
-        .with_file_group(FileGroup::new(vec![pf]))
-        .with_projection_indices(Some(projection))?;
+        let builder = self
+            .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+            .with_file_group(FileGroup::new(vec![pf]))
+            .with_projection_indices(Some(projection))?;
         let scan = DataSourceExec::from_data_source(builder.build());
 
         // Drop rows newer than the read snapshot, then present the catalog schema.
@@ -2454,6 +2506,7 @@ impl DuckLakeTable {
             physical_schema: self.physical_schema.clone(),
             row_lineage: false,
             columns: self.columns.clone(),
+            column_defaults: self.column_defaults.clone(),
             table_statistics: self.table_statistics.clone(),
             partition_spec: self.partition_spec.clone(),
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
@@ -2627,7 +2680,7 @@ impl DuckLakeTable {
             None
         };
         let scan = DataSourceExec::from_data_source(
-            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+            self.scan_config_builder(source)
                 .with_file_groups(file_groups)
                 .with_partitioned_by_file_group(true)
                 .with_projection_indices(Some(proj))?
@@ -2867,6 +2920,10 @@ impl TableProvider for DuckLakeTable {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.column_defaults.get(column)
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -4918,6 +4975,26 @@ mod tests {
         assert_eq!(
             parse_statistic_scalar("123.45", &decimal, &DataType::Decimal128(10, 2)),
             Some(ScalarValue::Decimal128(Some(12_345), 10, 2))
+        );
+    }
+
+    #[test]
+    fn expression_column_default_is_rejected_explicitly() {
+        let column =
+            DuckLakeTableColumn::new(1, "created_at".to_string(), "timestamp".to_string(), false)
+                .with_defaults(
+                    Some("current_timestamp".to_string()),
+                    Some("current_timestamp".to_string()),
+                    Some("expression".to_string()),
+                    Some("duckdb".to_string()),
+                );
+
+        let error = validate_column_defaults(&[column]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Unsupported feature: Default expression for column 'created_at' uses \
+             dialect 'duckdb'; only literal defaults are supported"
         );
     }
 

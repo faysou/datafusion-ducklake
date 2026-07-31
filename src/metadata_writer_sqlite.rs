@@ -1299,6 +1299,10 @@ async fn live_columns_for_stats(
                 .unwrap_or(arrow::datatypes::DataType::Null),
             ducklake_type,
             is_nullable: true,
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         });
     }
     Ok((columns, column_ids))
@@ -1558,9 +1562,10 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -1570,6 +1575,10 @@ async fn finalize_snapshot(
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut **tx)
                 .await?;
             },
@@ -1803,8 +1812,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Locate the live version of the column.
             let row = sqlx::query(
-                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column
-                 FROM ducklake_column
+                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column,
+                        initial_default, default_value, default_value_type, default_value_dialect
+                  FROM ducklake_column
                  WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
                    AND parent_column IS NULL",
             )
@@ -1824,6 +1834,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .try_get::<Option<bool>, _>("nulls_allowed")?
                 .unwrap_or(true);
             let parent_column: Option<i64> = row.try_get("parent_column")?;
+            let initial_default: Option<String> = row.try_get("initial_default")?;
+            let default_value: Option<String> = row.try_get("default_value")?;
+            let default_value_type: Option<String> = row.try_get("default_value_type")?;
+            let default_value_dialect: Option<String> = row.try_get("default_value_dialect")?;
 
             // No-op / not-a-widening guards. Canonical equality first so an
             // alias-only restatement is reported as "no change", not attempted.
@@ -1860,8 +1874,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_column
-                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed, parent_column)
-                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
+                      column_type, nulls_allowed, parent_column, initial_default, default_value,
+                      default_value_type, default_value_dialect)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(column_id)
             .bind(new_snapshot)
@@ -1871,6 +1887,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(new_ducklake_type)
             .bind(nulls_allowed)
             .bind(parent_column)
+            .bind(initial_default)
+            .bind(default_value)
+            .bind(default_value_type)
+            .bind(default_value_dialect)
             .execute(&mut *tx)
             .await?;
 
@@ -2263,9 +2283,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let parent_id = column.parent_index.map(|index| column_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -2275,6 +2296,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
             }

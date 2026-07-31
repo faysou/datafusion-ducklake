@@ -876,9 +876,10 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -888,6 +889,10 @@ async fn finalize_snapshot(
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut **tx)
                 .await?;
             },
@@ -1069,9 +1074,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                 let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -1081,6 +1087,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
             }
