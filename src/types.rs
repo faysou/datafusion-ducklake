@@ -152,6 +152,10 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         // Null type - map to varchar as there's no direct equivalent
         DataType::Null => Ok("varchar".to_string()),
 
+        // Dictionary keys are an Arrow encoding detail. DuckLake records the logical value
+        // type, while Parquet preserves dictionary encoding in the data file.
+        DataType::Dictionary(_, value) => arrow_to_ducklake_type(value),
+
         // List types
         DataType::List(field) | DataType::LargeList(field) => {
             let inner = arrow_to_ducklake_type(field.data_type())?;
@@ -982,6 +986,15 @@ mod tests {
             arrow_to_ducklake_type(&DataType::LargeBinary).unwrap(),
             "blob"
         );
+    }
+
+    #[test]
+    fn test_dictionary_uses_logical_value_type() {
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert_eq!(arrow_to_ducklake_type(&dictionary).unwrap(), "varchar");
+
+        let list = DataType::List(Arc::new(Field::new("item", dictionary, true)));
+        assert_eq!(arrow_to_ducklake_type(&list).unwrap(), "list<varchar>");
     }
 
     #[test]

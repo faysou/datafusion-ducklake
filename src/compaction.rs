@@ -32,7 +32,7 @@
 //! [`cleanup_old_files_sqlite`](crate::maintenance::cleanup_old_files_sqlite)
 //! reclaims them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -44,6 +44,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
 use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
 
+use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceRetirement};
 use crate::partition::PartitionSpec;
@@ -236,7 +237,9 @@ pub(crate) fn sorted_rewrite_output(
     }
     let ordering = LexOrdering::new(expressions)
         .ok_or_else(|| DuckLakeError::Internal("sort order is empty".to_string()))?;
-    Ok(SortExec::new(ordering, input).execute(0, context)?)
+    let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
+    let output = Arc::new(ColumnRenameExec::new(sorted, schema, HashMap::new()));
+    Ok(output.execute(0, context)?)
 }
 
 impl DuckLakeTable {

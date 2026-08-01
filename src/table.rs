@@ -2423,9 +2423,16 @@ impl DuckLakeTable {
             // Keep only matched rows, then apply the assignments to them.
             let matched_phys: Vec<ArrayRef> = phys_cols
                 .iter()
-                .map(|c| arrow::compute::filter(c.as_ref(), &mask))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                .enumerate()
+                .map(|(i, column)| {
+                    let filtered = arrow::compute::filter(column.as_ref(), &mask)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    crate::column_rename::coerce_column(
+                        &filtered,
+                        self.physical_schema.field(i).data_type(),
+                    )
+                })
+                .collect::<DataFusionResult<_>>()?;
             let matched_batch =
                 RecordBatch::try_new(self.physical_schema.clone(), matched_phys.clone())?;
             let matched_rows = matched_batch.num_rows();

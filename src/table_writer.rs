@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -1644,11 +1643,10 @@ struct PartitionSink {
 impl PartitionSink {
     /// Split `batch` by partition and write each group to that partition's roller.
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        // The group batches are built with the field-id-tagged schema, so the roller
-        // re-imposing that schema is a no-op rather than a mismatch.
+        let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
         let groups = crate::partition::split_batches_by_partition(
             &self.schema_with_ids,
-            std::slice::from_ref(batch),
+            std::slice::from_ref(&batch_with_ids),
             &self.spec,
         )?;
         for (values, batches) in groups {
@@ -2333,54 +2331,14 @@ fn apply_field_ids(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch
         .columns()
         .iter()
         .zip(schema.fields())
-        .map(|(column, field)| array_with_data_type(column, field.data_type()))
+        .map(|(column, field)| {
+            crate::column_rename::array_with_data_type(column, field.data_type())
+                .map_err(crate::error::DuckLakeError::Arrow)
+        })
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-fn array_with_data_type(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
-    fn rewrite(data: &ArrayData, data_type: &DataType) -> Result<ArrayData> {
-        if data.data_type() == data_type {
-            return Ok(data.clone());
-        }
-        let child_types = match data_type {
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::Map(field, _) => vec![field.data_type()],
-            DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
-            _ => {
-                return Err(crate::error::DuckLakeError::Internal(format!(
-                    "Cannot apply nested field ids to array type {:?} as {:?}",
-                    data.data_type(),
-                    data_type
-                )));
-            },
-        };
-        if child_types.len() != data.child_data().len() {
-            return Err(crate::error::DuckLakeError::Internal(format!(
-                "Array type {:?} has {} children, expected {} for {:?}",
-                data.data_type(),
-                data.child_data().len(),
-                child_types.len(),
-                data_type
-            )));
-        }
-        let children = data
-            .child_data()
-            .iter()
-            .zip(child_types)
-            .map(|(child, child_type)| rewrite(child, child_type))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(data
-            .clone()
-            .into_builder()
-            .data_type(data_type.clone())
-            .child_data(children)
-            .build()?)
-    }
-
-    Ok(make_array(rewrite(&array.to_data(), data_type)?))
+    Ok(crate::column_rename::record_batch_with_schema(
+        schema, columns,
+    )?)
 }
 
 fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
@@ -2407,7 +2365,7 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, StringArray, StringViewArray, StructArray};
     use arrow::datatypes::DataType;
 
     #[test]
@@ -2498,6 +2456,50 @@ mod tests {
             element.metadata().get("PARQUET:field_id"),
             Some(&"13".into())
         );
+    }
+
+    #[test]
+    fn test_apply_field_ids_rewrites_nested_field_metadata() {
+        let fields = vec![
+            Arc::new(Field::new("amount", DataType::Decimal128(38, 16), false)),
+            Arc::new(Field::new("currency", DataType::Utf8View, false)),
+        ];
+        let values = StructArray::new(
+            fields.clone().into(),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![1, 2])
+                        .with_precision_and_scale(38, 16)
+                        .unwrap(),
+                ),
+                Arc::new(StringViewArray::from(vec!["USD", "EUR"])),
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "money",
+            DataType::Struct(fields.into()),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(&schema, &[1, 2, 3]).unwrap());
+
+        let rewritten = apply_field_ids(&batch, schema_with_ids.clone()).unwrap();
+
+        assert_eq!(rewritten.schema(), schema_with_ids);
+        let DataType::Struct(fields) = rewritten.column(0).data_type() else {
+            panic!("expected struct");
+        };
+        assert_eq!(
+            fields[0].metadata().get("PARQUET:field_id"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            fields[1].metadata().get("PARQUET:field_id"),
+            Some(&"3".to_string())
+        );
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema_with_ids, None).unwrap();
+        writer.write(&rewritten).unwrap();
     }
 
     #[test]
