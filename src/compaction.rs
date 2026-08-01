@@ -315,6 +315,14 @@ impl DuckLakeTable {
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
+        let target_file_size = if opts.target_file_size == MergeOptions::default().target_file_size
+        {
+            self.write_options()
+                .target_file_size
+                .unwrap_or(crate::table_writer::DEFAULT_TARGET_FILE_SIZE) as u64
+        } else {
+            opts.target_file_size
+        };
 
         // Candidates: live, delete-free, below-target files with a known origin
         // snapshot + schema version, ordered so adjacency and same-version
@@ -339,7 +347,7 @@ impl DuckLakeTable {
                     && f.begin_snapshot.is_some()
                     && f.schema_version.is_some()
                     && (f.file.file_size_bytes as u64) >= opts.min_file_size
-                    && (f.file.file_size_bytes as u64) < opts.target_file_size
+                    && (f.file.file_size_bytes as u64) < target_file_size
             })
             .collect();
         // Sort by (schema_version, partition identity, data_file_id) so both the
@@ -372,7 +380,7 @@ impl DuckLakeTable {
                 bin.push(candidates[i]);
                 running += candidates[i].file.file_size_bytes as u64;
                 i += 1;
-                if running >= opts.target_file_size {
+                if running >= target_file_size {
                     break;
                 }
             }
@@ -402,7 +410,7 @@ impl DuckLakeTable {
         // Taking them from the table rather than from a per-call option keeps
         // that single source of truth: one catalog setting, both paths.
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?
-            .with_options(&self.write_options);
+            .with_options(self.write_options());
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
@@ -507,14 +515,16 @@ impl DuckLakeTable {
             // grouping key), so the merged output inherits it: same Hive directory,
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
-            let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &top_level_column_ids,
-                );
-                crate::partition::hive_subpath(&names, &partition_values)
-            });
+            let subpath = partition_id
+                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                .map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
             let file = table_writer
                 .write_compacted_file_stream(
                     schema_name,
@@ -596,7 +606,7 @@ impl DuckLakeTable {
         // it has to carry them too — the two writer constructions are the only
         // places in this crate that could silently disagree about it.
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?
-            .with_options(&self.write_options);
+            .with_options(self.write_options());
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
@@ -665,14 +675,16 @@ impl DuckLakeTable {
                 // holds a subset of that file's rows and therefore its exact
                 // partition: inherit the identity and the Hive directory.
                 let (partition_id, partition_values) = partition_key(tf);
-                let subpath = partition_id.map(|pid| {
-                    let names = self.partition_path_names(
-                        live_partition_spec.as_ref(),
-                        pid,
-                        &top_level_column_ids,
-                    );
-                    crate::partition::hive_subpath(&names, &partition_values)
-                });
+                let subpath = partition_id
+                    .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                    .map(|pid| {
+                        let names = self.partition_path_names(
+                            live_partition_spec.as_ref(),
+                            pid,
+                            &top_level_column_ids,
+                        );
+                        crate::partition::hive_subpath(&names, &partition_values)
+                    });
                 let file = table_writer
                     .write_compacted_file_stream(
                         schema_name,

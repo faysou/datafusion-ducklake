@@ -16,9 +16,9 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping, DuckLakeNameMappingEntry,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
-    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
-    reconstruct_columns, reconstruct_columns_with_table,
+    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider, MetadataSetting,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
+    block_on, reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -263,6 +263,52 @@ impl MetadataProvider for MulticatalogProvider {
                         .to_string(),
                 )
             })
+        })
+    }
+
+    fn get_metadata_settings(
+        &self,
+        schema_id: Option<i64>,
+        table_id: Option<i64>,
+    ) -> Result<HashMap<String, String>> {
+        block_on(async {
+            let has_scope_id: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = current_schema() \
+                 AND table_name = 'ducklake_metadata' AND column_name = 'scope_id')",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let rows = if has_scope_id {
+                sqlx::query("SELECT key, value, scope, scope_id FROM ducklake_metadata")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: row.try_get(2)?,
+                            scope_id: row.try_get(3)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                sqlx::query("SELECT key, value FROM ducklake_metadata WHERE scope IS NULL")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: None,
+                            scope_id: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            resolve_metadata_settings(rows, schema_id, table_id)
         })
     }
 

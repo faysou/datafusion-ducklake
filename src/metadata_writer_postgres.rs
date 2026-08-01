@@ -34,7 +34,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
         value VARCHAR NOT NULL,
-        scope VARCHAR
+        scope VARCHAR,
+        scope_id BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -4190,6 +4191,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
             execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
             migrate_column_default_metadata(&self.pool).await?;
+            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")
+                .execute(&self.pool)
+                .await?;
             // Upgrade a pre-existing store's ducklake_column to the composite PK
             // (legacy single-row column_id PK → versioned-capable). Idempotent.
             migrate_ducklake_column_to_composite_pk(&self.pool).await?;

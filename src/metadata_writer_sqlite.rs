@@ -36,7 +36,8 @@ const SQL_CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
     value VARCHAR NOT NULL,
-    scope VARCHAR
+    scope VARCHAR,
+    scope_id INTEGER
 );
 
 -- `schema_version` is the per-catalog monotonic schema counter from the DuckLake
@@ -917,6 +918,21 @@ async fn migrate_add_schema_version(pool: &SqlitePool) -> Result<()> {
         )
         .execute(pool)
         .await?;
+    }
+    Ok(())
+}
+
+async fn migrate_add_metadata_scope_id(pool: &SqlitePool) -> Result<()> {
+    let has_scope_id: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('ducklake_metadata') \
+         WHERE name = 'scope_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_scope_id {
+        sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope_id INTEGER")
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -4036,6 +4052,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
             // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
             migrate_ducklake_column_drop_pk(&self.pool).await?;
+            migrate_add_metadata_scope_id(&self.pool).await?;
             // Upgrade a pre-existing catalog to track schema_version (add the
             // ducklake_snapshot.schema_version column; idempotent, lossless).
             migrate_add_schema_version(&self.pool).await?;

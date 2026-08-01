@@ -2782,6 +2782,13 @@ impl DuckLakeTable {
         self.writer.as_ref()
     }
 
+    /// Resolved catalog settings with explicit Rust overrides applied. Used by
+    /// maintenance writes so their Parquet layout matches ordinary inserts.
+    #[cfg(feature = "write")]
+    pub(crate) fn write_options(&self) -> &crate::table_writer::DuckLakeWriteOptions {
+        &self.write_options
+    }
+
     /// The schema name, when this table was opened writable. Used by the
     /// compaction ops to author output file paths.
     #[cfg(feature = "write")]
@@ -3434,11 +3441,15 @@ impl TableProvider for DuckLakeTable {
         // per-partition file remains a sorted subsequence. An unsupported expression
         // or missing sort column is rejected before execution rather than silently
         // producing files that violate the active sort contract.
-        let live_sort = self
-            .provider
-            .get_sort_spec(self.table_id, head_snapshot)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref())?;
+        let ordering = if self.write_options.sort_on_insert.unwrap_or(true) {
+            let live_sort = self
+                .provider
+                .get_sort_spec(self.table_id, head_snapshot)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            sort_ordering_for(&input.schema(), live_sort.as_ref())?
+        } else {
+            None
+        };
         // Wrap the input in a SortExec now AND declare the same requirement on
         // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
         // (a plain SortExec with no downstream ordering requirement would be
