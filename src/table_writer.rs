@@ -1937,7 +1937,7 @@ impl TableWriteSession {
                 return self.finish_single_file().await;
             }
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = self.metadata.register_data_files(
+            let committed = self.metadata.register_data_files_with_commit_metadata(
                 self.table_id,
                 &self.schema_name,
                 &self.table_name,
@@ -1947,6 +1947,8 @@ impl TableWriteSession {
                 self.base_snapshot_id,
                 &self.columns,
                 &self.field_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
             )?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
@@ -1967,7 +1969,7 @@ impl TableWriteSession {
                 return self.finish_single_file().await;
             }
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = self.metadata.register_data_files(
+            let committed = self.metadata.register_data_files_with_commit_metadata(
                 self.table_id,
                 &self.schema_name,
                 &self.table_name,
@@ -1977,6 +1979,8 @@ impl TableWriteSession {
                 self.base_snapshot_id,
                 &self.columns,
                 &self.field_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
             )?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
