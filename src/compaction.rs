@@ -320,10 +320,16 @@ impl DuckLakeTable {
         // snapshot + schema version, ordered so adjacency and same-version
         // grouping fall out of the sort.
         let table_files = self.files()?;
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
                 f.delete_file_id.is_none()
+                    // Inlined deletes mask rows without a delete file. Merging such a
+                    // file with SourceRetirement::Remove would erase the masked rows
+                    // from every snapshot and leave ducklake_inlined_delete_<id> rows
+                    // pointing at a removed file, so it is not a merge candidate.
+                    && !inlined_deletes.contains_key(&f.data_file_id)
                     // Never re-merge an existing partial file: its rows carry
                     // per-row origins in the embedded `_ducklake_internal_snapshot_id`
                     // column, which the read path used to reconstruct them does NOT
@@ -437,7 +443,9 @@ impl DuckLakeTable {
             // Read each source's live rows (with original rowids) and its origin.
             let mut per_source: Vec<(Vec<RecordBatch>, i64)> = Vec::with_capacity(bin.len());
             for tf in bin {
-                let scan = self.build_update_scan(state, tf).await?;
+                let scan = self
+                    .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
+                    .await?;
                 let batches =
                     datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx())
                         .await?;
@@ -450,6 +458,9 @@ impl DuckLakeTable {
                 sources.push(CompactionSourceFile {
                     data_file_id: tf.data_file_id,
                     delete_file_id: None,
+                    // Candidates exclude files with inlined deletes, so the fence
+                    // expects none at commit time.
+                    inlined_delete_count: 0,
                 });
                 files_processed += 1;
             }
@@ -606,6 +617,7 @@ impl DuckLakeTable {
             .data_file_ids
             .map(|ids| ids.into_iter().collect::<HashSet<_>>());
         let table_files = self.files()?;
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         for tf in &table_files {
             let record_count = tf.max_row_count.unwrap_or(0);
             let delete_count = tf.delete_count.unwrap_or(0);
@@ -624,7 +636,9 @@ impl DuckLakeTable {
                 }
             }
 
-            let scan = self.build_update_scan(state, tf).await?;
+            let scan = self
+                .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
+                .await?;
             let batches =
                 datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx())
                     .await?;
@@ -634,6 +648,9 @@ impl DuckLakeTable {
             sources.push(CompactionSourceFile {
                 data_file_id: tf.data_file_id,
                 delete_file_id: tf.delete_file_id,
+                inlined_delete_count: inlined_deletes
+                    .get(&tf.data_file_id)
+                    .map_or(0, |positions| positions.len() as i64),
             });
 
             let live_rows = out.matched_count;

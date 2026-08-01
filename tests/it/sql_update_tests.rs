@@ -527,6 +527,23 @@ async fn update_expression_referencing_column() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn update_does_not_resurrect_inlined_deletes() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2, 3], vec![10, 20, 30]).await;
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp_dir.path().join("test.db"),
+        &[1],
+    )
+    .await;
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 10), (3, 30)]);
+
+    let ctx = writable_ctx(&temp_dir).await;
+    let count = run_dml_count(&ctx, "UPDATE ducklake.main.t SET val = val + 1").await;
+    assert_eq!(count, 2);
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 11), (3, 31)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn update_multi_row_multi_file_is_one_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     // Two data files: A=(1,10),(2,20); B=(3,30),(4,40).

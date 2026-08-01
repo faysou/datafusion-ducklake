@@ -3554,6 +3554,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // Fence + compare-and-swap per source (see commit_compaction on the
             // SQLite writer for the rationale): abort — never resurrect rows —
             // if a source was retired or its live delete file changed since read.
+            let inlined_table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
             for src in sources {
                 let target_live: Option<i64> = sqlx::query_scalar(
                     "SELECT data_file_id FROM ducklake_data_file
@@ -3578,6 +3579,34 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(src.data_file_id)
                 .fetch_optional(&mut *tx)
                 .await?;
+                // Inlined deletes mutate only ducklake_inlined_delete_<table_id>,
+                // so neither check here sees them; their rows are append-only, so
+                // a count compare-and-swap detects a concurrent inlined DELETE.
+                // Probe existence first: a statement error would abort the whole
+                // transaction, so the missing-table case cannot be caught here.
+                let inlined_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(&inlined_table)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                let current_inlined: i64 = if inlined_exists {
+                    sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT COUNT(*) FROM \"{inlined_table}\" WHERE file_id = $1"
+                    )))
+                    .bind(src.data_file_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                } else {
+                    0
+                };
+                if current_inlined != src.inlined_delete_count {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: the inlined deletes of \
+                         source data file {} changed from {} to {current_inlined} rows since \
+                         snapshot {base_snapshot} (a concurrent inlined DELETE). Re-open the \
+                         catalog at the latest snapshot and re-plan.",
+                        src.data_file_id, src.inlined_delete_count
+                    )));
+                }
                 if current_delete != src.delete_file_id {
                     return Err(crate::DuckLakeError::Conflict(format!(
                         "compaction of table {table_id} could not commit: the live delete file of \

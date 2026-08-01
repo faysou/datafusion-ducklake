@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   let a file be judged entirely null and dropped while still holding matching
   rows (#276).
 
+- `merge_adjacent_files` no longer selects a data file whose rows are masked
+  only by inlined deletes, so a merge cannot erase those rows from historical
+  snapshots or leave `ducklake_inlined_delete_<table_id>` entries pointing at
+  a removed file; time travel across the merge is preserved (#262).
+- SQL `DELETE` counts positions already removed by inlined deletes as deleted,
+  so a predicate matching only inline-deleted rows is a no-op that commits no
+  snapshot and no delete file, and reported delete counts are exact (#262).
+- Compaction commits fence on each source file's inlined-delete row count and
+  abort with `Conflict` when a concurrent inlined `DELETE` lands between
+  planning and commit, instead of resurrecting the deleted row at the new head
+  (#262).
 - Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB,
   PostgreSQL, and MySQL metadata catalogs. DuckLake inlines inserts of up to 10
   rows by default, so affected queries previously omitted them without warning;

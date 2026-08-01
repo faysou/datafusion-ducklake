@@ -586,6 +586,15 @@ pub struct DuckLakeTableColumn {
     pub default_value_dialect: Option<String>,
 }
 
+/// A positional deletion stored directly in a DuckLake metadata catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuckLakeInlinedDelete {
+    /// Catalog id of the Parquet data file containing the deleted row.
+    pub data_file_id: i64,
+    /// Zero-based physical row position within the Parquet data file.
+    pub row_id: i64,
+}
+
 pub(crate) fn is_inlined_data_table(name: &str) -> bool {
     name.starts_with("ducklake_inlined_data_")
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -593,6 +602,15 @@ pub(crate) fn is_inlined_data_table(name: &str) -> bool {
 
 pub(crate) const INLINED_DATA_REMEDIATION: &str =
     "flush inlined data to Parquet (or disable data inlining at write time)";
+
+pub(crate) fn inlined_delete_table_name(table_id: i64) -> Result<String> {
+    if table_id < 0 {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "DuckLake table id must be non-negative, was {table_id}"
+        )));
+    }
+    Ok(format!("ducklake_inlined_delete_{table_id}"))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InlinedDataBackend {
@@ -1355,6 +1373,20 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _snapshot_id: i64,
         _columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        Ok(Vec::new())
+    }
+
+    /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
+    /// that are visible at `snapshot_id`.
+    ///
+    /// The default keeps legacy catalogs and providers without deletion inlining
+    /// source-compatible. Implementations return an empty vector when the
+    /// physical table does not exist.
+    fn get_inlined_deletes(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedDelete>> {
         Ok(Vec::new())
     }
 

@@ -3431,6 +3431,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // (MAX(snapshot_id)) only ever resolves to the fully-applied layout.
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let inlined_table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
 
             // Conflict fence per source: the data file must still be live, and its
             // live delete file must still match what the caller read the source's
@@ -3472,6 +3473,35 @@ impl MetadataWriter for SqliteMetadataWriter {
                          snapshot {base_snapshot} (a concurrent DELETE/UPDATE). Re-open the \
                          catalog at the latest snapshot and re-plan.",
                         src.data_file_id, src.delete_file_id
+                    )));
+                }
+
+                // Inlined deletes mutate only ducklake_inlined_delete_<table_id>,
+                // so neither check above sees them; their rows are append-only,
+                // so a count compare-and-swap detects a concurrent inlined DELETE.
+                let inlined_exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                )
+                .bind(&inlined_table)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let current_inlined: i64 = if inlined_exists.is_some() {
+                    sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT COUNT(*) FROM \"{inlined_table}\" WHERE file_id = ?"
+                    )))
+                    .bind(src.data_file_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                } else {
+                    0
+                };
+                if current_inlined != src.inlined_delete_count {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: the inlined deletes of \
+                         source data file {} changed from {} to {current_inlined} rows since \
+                         snapshot {base_snapshot} (a concurrent inlined DELETE). Re-open the \
+                         catalog at the latest snapshot and re-plan.",
+                        src.data_file_id, src.inlined_delete_count
                     )));
                 }
             }

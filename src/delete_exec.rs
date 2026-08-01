@@ -289,6 +289,7 @@ async fn run_delete(
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
     let mut total_deleted: u64 = 0;
+    let inlined_deletes = table.inlined_deletes_by_file()?;
 
     for tf in &table_files {
         // A file rewritten by an UPDATE or by compaction is handled here like any
@@ -307,12 +308,16 @@ async fn run_delete(
             continue;
         }
 
-        // Already-deleted positions for this file (if a delete file is live).
-        // Rows already deleted are neither re-counted nor re-deleted.
-        let existing = match tf.delete_file {
+        // Already-deleted positions for this file: the live delete file plus any
+        // inlined deletes. Rows already deleted are neither re-counted nor
+        // re-deleted, and a predicate matching only such rows commits nothing.
+        let mut existing = match tf.delete_file {
             Some(ref df) => table.read_delete_file_positions(state, df).await?,
             None => HashSet::new(),
         };
+        if let Some(inlined) = inlined_deletes.get(&tf.data_file_id) {
+            existing.extend(inlined);
+        }
 
         let newly_deleted = matched.difference(&existing).count() as u64;
         if newly_deleted == 0 {

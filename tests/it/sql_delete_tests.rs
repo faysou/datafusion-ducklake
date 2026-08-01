@@ -246,6 +246,52 @@ async fn delete_already_deleted_is_noop() {
     assert_eq!(read_ids(&temp).await, vec![1, 3, 4]);
 }
 
+/// Rows already removed by INLINED deletes are neither re-counted nor
+/// re-committed: a DELETE matching only such rows is a no-op, and a mixed
+/// predicate counts only the still-live rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_of_inline_deleted_rows_is_noop() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+    // id = 2 sits at physical position 1 of the only data file.
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+    assert_eq!(
+        read_ids(&temp).await,
+        vec![1, 3, 4],
+        "inline delete applied"
+    );
+
+    let snaps = snapshot_count(&temp).await;
+    let ctx1 = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await,
+        0,
+        "the inline-deleted row is not re-counted"
+    );
+    assert_eq!(
+        snapshot_count(&temp).await,
+        snaps,
+        "a DELETE matching only inline-deleted rows creates no snapshot"
+    );
+
+    let ctx2 = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx2, "DELETE FROM ducklake.main.t WHERE id IN (2, 3)").await,
+        1,
+        "only the live row counts"
+    );
+    assert_eq!(read_ids(&temp).await, vec![1, 4]);
+}
+
 /// A DELETE matching no rows deletes nothing and reports 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_no_match() {
