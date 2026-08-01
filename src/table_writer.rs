@@ -456,7 +456,7 @@ impl DuckLakeTableWriter {
         // column (not a catalog column), so it is absent from `columns`/`column_ids`
         // and the metadata commit never sees it.
         let schema_with_ids = {
-            let mut schema = build_schema_with_field_ids(arrow_schema, &setup.field_ids);
+            let mut schema = build_schema_with_field_ids(arrow_schema, &setup.field_ids)?;
             if embed_rowid {
                 let mut fields: Vec<Field> =
                     schema.fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -735,11 +735,13 @@ impl DuckLakeTableWriter {
     ///
     /// `data_schema` describes ONLY the table's data columns (catalog types, no
     /// rowid/snapshot); `data_column_ids` are their catalog `column_id`s (baked
-    /// in as parquet field-ids so a read maps them back). Each batch in `batches`
-    /// must have the data columns in order, then a trailing `Int64` rowid column,
-    /// and — when `embed_snapshot_id` — a further trailing `Int64` snapshot-id
-    /// column. Streams to a local staging file and multipart-uploads it, so peak
-    /// memory stays bounded regardless of file size.
+    /// in as parquet field-ids so a read maps them back), including nested field
+    /// ids. `stats_column_ids` contains only the top-level catalog ids used to
+    /// label per-column statistics. Each batch in `batches` must have the data
+    /// columns in order, then a trailing `Int64` rowid column, and — when
+    /// `embed_snapshot_id` — a further trailing `Int64` snapshot-id column.
+    /// Streams to a local staging file and multipart-uploads it, so peak memory
+    /// stays bounded regardless of file size.
     #[allow(clippy::too_many_arguments)]
     pub async fn write_compacted_file(
         &self,
@@ -747,6 +749,7 @@ impl DuckLakeTableWriter {
         table_name: &str,
         data_schema: &Schema,
         data_column_ids: &[i64],
+        stats_column_ids: &[i64],
         batches: &[RecordBatch],
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
@@ -775,6 +778,7 @@ impl DuckLakeTableWriter {
             table_name,
             data_schema,
             data_column_ids,
+            stats_column_ids,
             stream,
             embed_snapshot_id,
             partition_subpath,
@@ -793,6 +797,7 @@ impl DuckLakeTableWriter {
         table_name: &str,
         data_schema: &Schema,
         data_column_ids: &[i64],
+        stats_column_ids: &[i64],
         mut batches: SendableRecordBatchStream,
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
@@ -818,7 +823,7 @@ impl DuckLakeTableWriter {
         // embedded rowid column, and for a merged partial file the snapshot-id
         // column. Neither embedded column is a catalog column.
         let schema_with_ids = {
-            let base = build_schema_with_field_ids(data_schema, data_column_ids);
+            let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
             let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
             fields.push(embedded_rowid_field());
             if embed_snapshot_id {
@@ -856,7 +861,7 @@ impl DuckLakeTableWriter {
             crate::stats_collect::accumulate_nan_flags(
                 &mut nan_flags,
                 &batch,
-                data_column_ids.len(),
+                stats_column_ids.len(),
             );
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
@@ -880,7 +885,7 @@ impl DuckLakeTableWriter {
         // consuming the stream because the Parquet footer omits that signal.
         let column_stats = crate::stats_collect::collect_column_stats(
             temp.path(),
-            data_column_ids,
+            stats_column_ids,
             row_count,
             &nan_flags,
         );
@@ -978,7 +983,8 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids));
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
@@ -1131,7 +1137,8 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids));
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
@@ -1889,7 +1896,10 @@ impl TableWriteSession {
             .zip(expected_schema.fields().iter())
             .enumerate()
         {
-            if !expected_field.data_type().contains(batch_field.data_type()) {
+            if !Self::data_type_contains_ignoring_nested_names(
+                expected_field.data_type(),
+                batch_field.data_type(),
+            ) {
                 return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                     "Schema mismatch at column {}: batch has type {:?}, expected {:?}",
                     i,
@@ -1899,6 +1909,56 @@ impl TableWriteSession {
             }
         }
         Ok(())
+    }
+
+    fn data_type_contains_ignoring_nested_names(expected: &DataType, actual: &DataType) -> bool {
+        match (expected, actual) {
+            (DataType::List(expected), DataType::List(actual))
+            | (DataType::LargeList(expected), DataType::LargeList(actual))
+            | (DataType::ListView(expected), DataType::ListView(actual))
+            | (DataType::LargeListView(expected), DataType::LargeListView(actual)) => {
+                Self::field_contains_ignoring_name(expected, actual)
+            },
+            (
+                DataType::FixedSizeList(expected, expected_size),
+                DataType::FixedSizeList(actual, actual_size),
+            ) => {
+                expected_size == actual_size && Self::field_contains_ignoring_name(expected, actual)
+            },
+            (DataType::Map(expected, expected_sorted), DataType::Map(actual, actual_sorted)) => {
+                expected_sorted == actual_sorted
+                    && Self::field_contains_ignoring_name(expected, actual)
+            },
+            (DataType::Struct(expected), DataType::Struct(actual)) => {
+                expected.len() == actual.len()
+                    && expected
+                        .iter()
+                        .zip(actual.iter())
+                        .all(|(expected, actual)| {
+                            Self::field_contains_ignoring_name(expected, actual)
+                        })
+            },
+            (
+                DataType::Dictionary(expected_key, expected_value),
+                DataType::Dictionary(actual_key, actual_value),
+            ) => {
+                Self::data_type_contains_ignoring_nested_names(expected_key, actual_key)
+                    && Self::data_type_contains_ignoring_nested_names(expected_value, actual_value)
+            },
+            _ => expected.contains(actual),
+        }
+    }
+
+    fn field_contains_ignoring_name(expected: &Field, actual: &Field) -> bool {
+        Self::data_type_contains_ignoring_nested_names(expected.data_type(), actual.data_type())
+            && expected.dict_is_ordered() == actual.dict_is_ordered()
+            && (expected.is_nullable() || !actual.is_nullable())
+            && actual.metadata().iter().all(|(key, value)| {
+                expected
+                    .metadata()
+                    .get(key)
+                    .is_some_and(|expected| expected == value)
+            })
     }
 
     pub fn row_count(&self) -> i64 {
@@ -2196,37 +2256,45 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
         .collect()
 }
 
-fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
-    fn with_field_id(field: &Field, column_ids: &[i64], next_id: &mut usize) -> Field {
-        let field_id = column_ids[*next_id];
+fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Schema> {
+    fn with_field_id(field: &Field, column_ids: &[i64], next_id: &mut usize) -> Result<Field> {
+        let field_id = column_ids.get(*next_id).copied().ok_or_else(|| {
+            crate::error::DuckLakeError::Internal(format!(
+                "Missing field id for Arrow field '{}' at recursive position {}",
+                field.name(),
+                *next_id,
+            ))
+        })?;
         *next_id += 1;
         let data_type = match field.data_type() {
             DataType::List(child) => DataType::List(Arc::new(
-                with_field_id(child, column_ids, next_id).with_name("element"),
+                with_field_id(child, column_ids, next_id)?.with_name("element"),
             )),
             DataType::LargeList(child) => DataType::LargeList(Arc::new(
-                with_field_id(child, column_ids, next_id).with_name("element"),
+                with_field_id(child, column_ids, next_id)?.with_name("element"),
             )),
             DataType::FixedSizeList(child, size) => DataType::FixedSizeList(
-                Arc::new(with_field_id(child, column_ids, next_id).with_name("element")),
+                Arc::new(with_field_id(child, column_ids, next_id)?.with_name("element")),
                 *size,
             ),
             DataType::Struct(children) => DataType::Struct(
                 children
                     .iter()
-                    .map(|child| Arc::new(with_field_id(child, column_ids, next_id)))
-                    .collect::<Vec<_>>()
+                    .map(|child| with_field_id(child, column_ids, next_id).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()?
                     .into(),
             ),
             DataType::Map(entries, sorted) => {
                 let DataType::Struct(children) = entries.data_type() else {
-                    unreachable!("validated Arrow maps have struct entries")
+                    return Err(crate::error::DuckLakeError::InvalidConfig(
+                        "Arrow map entries must be a struct".to_string(),
+                    ));
                 };
                 let entries_type = DataType::Struct(
                     children
                         .iter()
-                        .map(|child| Arc::new(with_field_id(child, column_ids, next_id)))
-                        .collect::<Vec<_>>()
+                        .map(|child| with_field_id(child, column_ids, next_id).map(Arc::new))
+                        .collect::<Result<Vec<_>>>()?
                         .into(),
                 );
                 DataType::Map(
@@ -2241,18 +2309,23 @@ fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
         };
         let mut metadata: HashMap<String, String> = field.metadata().clone();
         metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
-        Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
+        Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
     }
 
     let mut next_id = 0;
-    let fields: Vec<Field> = schema
+    let fields = schema
         .fields()
         .iter()
         .map(|field| with_field_id(field, column_ids, &mut next_id))
-        .collect();
-    assert_eq!(next_id, column_ids.len());
+        .collect::<Result<Vec<_>>>()?;
+    if next_id != column_ids.len() {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "Field id count {} exceeds Arrow schema node count {next_id}",
+            column_ids.len(),
+        )));
+    }
 
-    Schema::new_with_metadata(fields, schema.metadata().clone())
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 fn apply_field_ids(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
@@ -2362,7 +2435,7 @@ mod tests {
         ]);
 
         let column_ids = vec![1, 2];
-        let schema_with_ids = build_schema_with_field_ids(&schema, &column_ids);
+        let schema_with_ids = build_schema_with_field_ids(&schema, &column_ids).unwrap();
 
         // Check that field_ids are embedded in metadata
         let field0_metadata = schema_with_ids.field(0).metadata();
@@ -2400,7 +2473,7 @@ mod tests {
         );
         let schema = Schema::new(vec![Field::new("attrs", map, true)]);
 
-        let schema = build_schema_with_field_ids(&schema, &[10, 11, 12, 13]);
+        let schema = build_schema_with_field_ids(&schema, &[10, 11, 12, 13]).unwrap();
         let root = schema.field(0);
         assert_eq!(root.metadata().get("PARQUET:field_id"), Some(&"10".into()));
         let DataType::Map(entries, false) = root.data_type() else {
@@ -2428,6 +2501,22 @@ mod tests {
     }
 
     #[test]
+    fn build_schema_with_field_ids_rejects_missing_recursive_id() {
+        let schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+
+        let error = build_schema_with_field_ids(&schema, &[10]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Internal error: Missing field id for Arrow field 'item' at recursive position 1",
+        );
+    }
+
+    #[test]
     fn test_write_parquet_to_buffer_with_field_ids() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -2444,7 +2533,7 @@ mod tests {
         .unwrap();
 
         let column_ids = vec![10, 20];
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(&schema, &column_ids));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(&schema, &column_ids).unwrap());
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
@@ -2474,7 +2563,7 @@ mod tests {
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
             .build();
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(&batch.schema(), &[1]));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(&batch.schema(), &[1]).unwrap());
         let mut writer =
             ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props)).unwrap();
 

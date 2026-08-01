@@ -1986,9 +1986,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Locate the live version of the column.
             let row = sqlx::query(
-                "SELECT column_id, column_type, column_order, nulls_allowed
+                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column
                  FROM ducklake_column
-                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                   AND parent_column IS NULL",
             )
             .bind(table_id)
             .bind(column_name)
@@ -2005,6 +2006,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let nulls_allowed: bool = row
                 .try_get::<Option<bool>, _>("nulls_allowed")?
                 .unwrap_or(true);
+            let parent_column: Option<i64> = row.try_get("parent_column")?;
 
             // No-op / not-a-widening guards. Canonical equality first so an
             // alias-only restatement is reported as "no change", not attempted.
@@ -2041,8 +2043,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_column
-                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed)
-                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed, parent_column)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             )
             .bind(column_id)
             .bind(new_snapshot)
@@ -2051,6 +2053,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(column_name)
             .bind(new_ducklake_type)
             .bind(nulls_allowed)
+            .bind(parent_column)
             .execute(&mut *tx)
             .await?;
 
@@ -2101,7 +2104,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             for (name, _transform) in columns {
                 let column_id: i64 = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(name)
@@ -2295,7 +2299,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 })?;
                 let exists: Option<i64> = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(&column)
@@ -4538,6 +4543,95 @@ mod tests {
             live, 1,
             "exactly one live version per field-id after promote"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn top_level_name_resolution_ignores_nested_collision() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snapshot).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "events", None, snapshot)
+            .unwrap();
+        writer
+            .set_columns(
+                table_id,
+                &[ColumnDef::new("id", "int32", false).unwrap()],
+                snapshot,
+            )
+            .unwrap();
+        let top_level_id: i64 = sqlx::query_scalar(
+            "SELECT column_id FROM ducklake_column
+             WHERE table_id = ? AND column_name = 'id' AND parent_column IS NULL",
+        )
+        .bind(table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        let nested_id = top_level_id + 1;
+        sqlx::query(
+            "INSERT INTO ducklake_column
+                 (column_id, table_id, column_name, column_type, column_order,
+                  nulls_allowed, parent_column, begin_snapshot)
+             VALUES (?, ?, 'id', 'int16', 1, 1, ?, ?)",
+        )
+        .bind(nested_id)
+        .bind(table_id)
+        .bind(top_level_id)
+        .bind(snapshot)
+        .execute(&writer.pool)
+        .await
+        .unwrap();
+
+        writer.promote_column_type(table_id, "id", "int64").unwrap();
+        writer
+            .set_partition_spec(
+                table_id,
+                &[("id".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        writer
+            .set_sort_spec(
+                table_id,
+                &[crate::sort::SortField::column(
+                    0,
+                    "id",
+                    crate::sort::SortDirection::Asc,
+                    crate::sort::NullOrder::NullsLast,
+                )],
+            )
+            .unwrap();
+
+        let top_level_type: String = sqlx::query_scalar(
+            "SELECT column_type FROM ducklake_column
+             WHERE table_id = ? AND column_name = 'id' AND parent_column IS NULL
+               AND end_snapshot IS NULL",
+        )
+        .bind(table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        let nested: (String, Option<i64>) = sqlx::query_as(
+            "SELECT column_type, parent_column FROM ducklake_column
+             WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(table_id)
+        .bind(nested_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        let partition_column_id: i64 = sqlx::query_scalar(
+            "SELECT column_id FROM ducklake_partition_column
+             WHERE table_id = ? ORDER BY partition_id DESC LIMIT 1",
+        )
+        .bind(table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(top_level_type, "int64");
+        assert_eq!(nested, ("int16".to_string(), Some(top_level_id)));
+        assert_eq!(partition_column_id, top_level_id);
     }
 
     /// Phase D (old-version data → latest): a catalog whose `ducklake_column` is in

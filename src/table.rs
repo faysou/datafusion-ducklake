@@ -1747,8 +1747,14 @@ impl DuckLakeTable {
         // parquet field-id that is neither a reserved embedded column nor one of
         // the current catalog `column_id`s is a since-dropped column. Compaction
         // uses this to refuse merging a file whose data would be lost.
-        let current_column_ids: std::collections::HashSet<i32> =
-            self.columns.iter().map(|c| c.column_id as i32).collect();
+        let current_column_ids: std::collections::HashSet<i32> = self
+            .columns
+            .iter()
+            .flat_map(|column| {
+                std::iter::once(column.column_id).chain(column.nested_column_ids.iter().copied())
+            })
+            .map(|column_id| column_id as i32)
+            .collect();
         let drops_current_columns = field_id_map.keys().any(|fid| {
             *fid != ROW_ID_PARQUET_FIELD_ID
                 && *fid != SNAPSHOT_ID_PARQUET_FIELD_ID

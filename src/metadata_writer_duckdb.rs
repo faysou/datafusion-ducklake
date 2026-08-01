@@ -1259,7 +1259,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let column_id: i64 = tx
                 .query_row(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                     params![table_id, name.as_str()],
                     |row| row.get(0),
                 )
@@ -1422,7 +1423,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let exists: Option<i64> = tx
                 .query_row(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                     params![table_id, column.as_str()],
                     |row| row.get(0),
                 )

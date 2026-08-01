@@ -88,14 +88,14 @@ fn parquet_schema_fields(path: &std::path::Path) -> Vec<(String, Option<i32>)> {
 }
 
 fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
-    let Ok(duckdb_cli) = std::env::var("DUCKDB_CLI") else {
-        return;
-    };
+    let conformance_path = catalog_path.with_file_name("duckdb-conformance.db");
+    std::fs::copy(catalog_path, &conformance_path).unwrap();
 
-    // This fork's catalog schema predates fields DuckLake 1.5.5 requires. Add
-    // those compatibility fields in the fixture before testing the nested data
-    // layout; none of these statements alter ducklake_column or the Parquet file.
-    let query = format!(
+    // This fork's catalog schema predates fields the official DuckLake extension requires. Add
+    // those compatibility fields to a disposable catalog copy before testing the
+    // nested data layout; none of these statements alter ducklake_column, the
+    // source catalog, or the Parquet file.
+    let setup = format!(
         "INSTALL sqlite; LOAD sqlite; \
          ATTACH '{}' AS raw (TYPE sqlite); \
          ALTER TABLE raw.ducklake_snapshot ADD COLUMN next_catalog_id BIGINT DEFAULT 0; \
@@ -141,27 +141,38 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
          ); \
          ALTER TABLE raw.ducklake_data_file ADD COLUMN file_order BIGINT DEFAULT 0; \
          ALTER TABLE raw.ducklake_data_file ADD COLUMN file_format VARCHAR DEFAULT 'parquet'; \
+         ALTER TABLE raw.ducklake_data_file ADD COLUMN partial_file_info VARCHAR; \
          UPDATE raw.ducklake_data_file SET footer_size = NULL; \
          ALTER TABLE raw.ducklake_delete_file ADD COLUMN format VARCHAR DEFAULT 'parquet'; \
          DETACH raw; \
          INSTALL ducklake; LOAD ducklake; \
-         ATTACH 'ducklake:{}' AS official (META_TYPE 'sqlite'); \
-         SELECT id, bids[1].price, len(bids) FROM official.main.depths ORDER BY id;",
-        catalog_path.display(),
-        catalog_path.display()
+         ATTACH 'ducklake:{}' AS official (META_TYPE 'sqlite');",
+        conformance_path.display(),
+        conformance_path.display()
     );
-    let output = std::process::Command::new(duckdb_cli)
-        .args(["-csv", "-noheader", "-c", &query])
-        .output()
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection.execute_batch(&setup).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, CAST(bids[1].price AS VARCHAR), len(bids)
+             FROM official.main.depths ORDER BY id",
+        )
         .unwrap();
-    assert!(
-        output.status.success(),
-        "DuckDB extension query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "1,101.0000000000000000,2\n2,99.0000000000000000,1\n"
+        rows,
+        vec![(1, "101.0000000000000000".to_string(), 2), (2, "99.0000000000000000".to_string(), 1),],
     );
 }
 
@@ -1288,6 +1299,62 @@ async fn test_streaming_write_api() {
         .unwrap()
         .value(0);
     assert_eq!(count, 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_streaming_write_list_column() {
+    use arrow::datatypes::Int32Type;
+
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(10), Some(11)]),
+        Some(vec![Some(20)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("items", values.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(values)],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let mut session = table_writer
+        .begin_write("main", "streaming_list", &schema, WriteMode::Replace)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    assert_eq!(session.finish().await.unwrap().records_written, 2);
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT id, items FROM test.main.streaming_list ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2]);
+    let first = values.value(0);
+    let first = first.as_any().downcast_ref::<Int32Array>().unwrap();
+    let second = values.value(1);
+    let second = second.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(first.values(), &[10, 11]);
+    assert_eq!(second.values(), &[20]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

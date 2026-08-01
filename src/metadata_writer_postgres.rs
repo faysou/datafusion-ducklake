@@ -1591,9 +1591,10 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Live version of the column.
             let row = sqlx::query(
-                "SELECT column_id, column_type, column_order, nulls_allowed
+                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column
                  FROM ducklake_column
-                 WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+                 WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL
+                   AND parent_column IS NULL",
             )
             .bind(table_id)
             .bind(column_name)
@@ -1610,6 +1611,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             let nulls_allowed: bool = row
                 .try_get::<Option<bool>, _>("nulls_allowed")?
                 .unwrap_or(true);
+            let parent_column: Option<i64> = row.try_get("parent_column")?;
 
             // No-op / not-a-widening guards (canonical first so an alias-only
             // restatement is "no change", not attempted).
@@ -1693,9 +1695,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_column
-                     (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                     (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot, parent_column)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(column_id)
             .bind(table_id)
@@ -1704,6 +1706,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(column_order)
             .bind(nulls_allowed)
             .bind(snapshot_id)
+            .bind(parent_column)
             .execute(&mut *tx)
             .await?;
 
@@ -2253,7 +2256,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             for (name, _transform) in columns {
                 let column_id: i64 = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(name)
@@ -2531,7 +2535,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 })?;
                 let exists: Option<i64> = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(&column)

@@ -1381,7 +1381,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             for (name, _transform) in columns {
                 let column_id: i64 = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(name)
@@ -1566,7 +1567,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 })?;
                 let exists: Option<i64> = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(&column)

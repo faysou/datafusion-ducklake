@@ -272,7 +272,7 @@ fn append_column_def(
     let index = result.len();
     result.push(CatalogColumnDef {
         name: name.to_string(),
-        ducklake_type: catalog_type_name(data_type),
+        ducklake_type: catalog_type_name(data_type)?,
         is_nullable,
         parent_index,
     });
@@ -322,15 +322,14 @@ fn append_column_def(
     }
 }
 
-fn catalog_type_name(data_type: &DataType) -> String {
+fn catalog_type_name(data_type: &DataType) -> Result<String> {
     match data_type {
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-            "list".to_string()
+            Ok("list".to_string())
         },
-        DataType::Struct(_) => "struct".to_string(),
-        DataType::Map(_, _) => "map".to_string(),
-        _ => arrow_to_ducklake_type(data_type)
-            .expect("validated ColumnDef data types must have DuckLake scalar types"),
+        DataType::Struct(_) => Ok("struct".to_string()),
+        DataType::Map(_, _) => Ok("map".to_string()),
+        _ => arrow_to_ducklake_type(data_type),
     }
 }
 
@@ -2155,6 +2154,14 @@ mod tests {
         let definitions = catalog_column_defs(&columns).unwrap();
 
         assert!(assign_column_ids(&definitions, &[], &[10, 11]).is_err());
+    }
+
+    #[test]
+    fn catalog_type_name_returns_unsupported_scalar_error() {
+        let error =
+            catalog_type_name(&DataType::Duration(arrow::datatypes::TimeUnit::Second)).unwrap_err();
+
+        assert!(matches!(error, DuckLakeError::UnsupportedType(_)));
     }
 
     #[test]
