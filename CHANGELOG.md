@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data_inlining_row_limit`. Small writes can stay in the metadata catalog with
   stable row IDs, snapshot visibility, table statistics, mixed positional and
   inline deletes, and DuckDB extension interoperability.
+- SQL `DELETE` predicates spanning Parquet-resident and catalog-inlined rows
+  commit both forms in one snapshot on all four write backends: DuckDB and
+  MySQL implement `commit_deletes`, and truncate ends visible inline rows and
+  returns the exact live row count, inline rows included (#273).
 
 ### Changed
 
@@ -31,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MySQL allocates every `data_file_id` and `delete_file_id` from the catalog
+  counters instead of mixing auto-increment appends with counter-seeded
+  explicit ids, removing certain primary-key collisions between the append and
+  update/delete/compaction paths (#273).
+- Every DuckDB and MySQL mutation flow — `set_delete_file`, positional
+  deletes, retire, truncate, and promote — records its
+  `ducklake_snapshot_changes.changes_made` entry, so data-modifying snapshots
+  are no longer hidden from spec readers (#273).
+- The first write to a table that was staged but never written commits and
+  seeds its stats row instead of failing permanently with a retry-suggesting
+  `Conflict` (#273).
 - SQLite and MySQL inline value encodings round-trip exactly: floats are
   stored as `DOUBLE` and binary columns, including `blob`/`BinaryView`, as
   `BLOB`. Bytes previously read back as the hex string of themselves, and
