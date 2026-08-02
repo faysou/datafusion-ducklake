@@ -98,8 +98,10 @@ async fn table_scoped_compression_controls_sql_insert_footer() {
     let pool = SqlitePool::connect(&connection).await.unwrap();
     sqlx::query(
         "INSERT INTO ducklake_metadata (key, value, scope, scope_id) \
-         VALUES ('parquet_compression', 'zstd', 'table', ?)",
+         VALUES ('parquet_compression', 'zstd', 'table', ?),
+                ('data_inlining_row_limit', '0', 'table', ?)",
     )
+    .bind(setup.table_id)
     .bind(setup.table_id)
     .execute(&pool)
     .await
@@ -140,6 +142,87 @@ async fn table_scoped_compression_controls_sql_insert_footer() {
         row_groups[0].columns()[0].compression(),
         Compression::ZSTD(_)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_scoped_row_limit_controls_sql_inlining() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("catalog.db");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let connection = format!("sqlite:{}?mode=rwc", database.display());
+    let writer = SqliteMetadataWriter::new_with_init(&connection)
+        .await
+        .unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+    let setup = writer
+        .begin_write_transaction("main", "events", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+         VALUES ('data_inlining_row_limit', '2', 'table', ?)",
+    )
+    .bind(setup.table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("lake", Arc::new(catalog));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    context
+        .register_batch(
+            "source",
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap(),
+        )
+        .unwrap();
+    context
+        .sql("INSERT INTO lake.main.events SELECT * FROM source")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    let files: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ?")
+            .bind(setup.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let physical_name: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(setup.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {physical_name} WHERE end_snapshot IS NULL"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(files, 0);
+    assert_eq!(rows, 2);
 }
 
 #[test]

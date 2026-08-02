@@ -143,6 +143,8 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
 
+Scoped writer settings and catalog-backed data inlining are supported.
+
 ### Views
 
 Every metadata backend reads snapshot-visible rows from `ducklake_view`. Catalogs without that

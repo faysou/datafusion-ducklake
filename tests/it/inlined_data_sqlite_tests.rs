@@ -12,10 +12,14 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
+use std::process::Command;
 use std::sync::Arc;
 
-use arrow::array::Int32Array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, BinaryViewArray, Float32Array, Float64Array, Int32Array, TimestampMicrosecondArray,
+    UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -24,8 +28,9 @@ use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter,
+    ColumnDef, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MetadataWriter, SnapshotCommitMetadata, SqliteMetadataProvider, SqliteMetadataWriter,
+    WriteMode,
 };
 
 fn table_schema() -> Arc<Schema> {
@@ -205,5 +210,698 @@ async fn catalog_without_inlining_is_unaffected() {
         .unwrap();
     // No ducklake_inlined_data_tables exists -> get_inlined_data returns empty,
     // reads are exactly the Parquet rows.
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_inlines_at_limit_and_uses_parquet_outside_limit() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    assert_eq!(result.files_written, 0);
+    assert_eq!(result.records_written, 2);
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20)]);
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let physical_name: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(result.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let inline_rows: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {physical_name} WHERE end_snapshot IS NULL"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let data_files: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ?")
+            .bind(result.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let stats: (i64, i64, i64) = sqlx::query_as(
+        "SELECT record_count, next_row_id, file_size_bytes
+         FROM ducklake_table_stats WHERE table_id = ?",
+    )
+    .bind(result.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(result.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inline_rows, 2);
+    assert_eq!(data_files, 0);
+    assert_eq!(stats, (2, 2, 0));
+    // The inline commit records the same composed ledger the Parquet path
+    // records: the DDL entries for the snapshot plus the write change.
+    assert_eq!(
+        changes,
+        format!(
+            "created_schema:\"main\",created_table:\"main\".\"t\",inserted_into_table:{}",
+            result.table_id
+        )
+    );
+
+    let writer = Arc::new(SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap());
+    let over_limit = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_rows(
+            "main",
+            "parquet_t",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1, 2, 3], vec![10, 20, 30])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(over_limit.files_written, 1);
+    assert_eq!(over_limit.records_written, 3);
+
+    let disabled = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(0),
+        ..Default::default()
+    };
+    let writer = Arc::new(SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap());
+    let disabled_result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&disabled)
+        .write_rows(
+            "main",
+            "disabled_t",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1], vec![10])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled_result.files_written, 1);
+    assert_eq!(disabled_result.records_written, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_inlined_uint64_round_trips_text_storage() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(1),
+        ..Default::default()
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(UInt64Array::from(vec![u64::MAX]))],
+    )
+    .unwrap();
+
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .append_table("main", "uint64_values", &[batch])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    let batches = context
+        .sql("SELECT value FROM ducklake.main.uint64_values")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), u64::MAX);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_ends_inlined_rows_and_updates_stats() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    let written = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+
+    let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let deleted = ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = deleted[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 1);
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10)]);
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let physical_name: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(written.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ended: (Option<i64>, Option<i64>) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT MIN(end_snapshot), MAX(end_snapshot) FROM {physical_name} WHERE id = 2"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stats: (i64, i64) = sqlx::query_as(
+        "SELECT record_count, next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+    )
+    .bind(written.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes ORDER BY snapshot_id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let snapshot: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ended, (Some(snapshot), Some(snapshot)));
+    assert_eq!(stats, (1, 2));
+    assert_eq!(changes, format!("deleted_from_table:{}", written.table_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_all_ends_every_inlined_row() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let deleted = ctx
+        .sql("DELETE FROM ducklake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = deleted[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 2);
+    assert!(read_rows(&t, None).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_commits_parquet_and_inlined_rows_atomically() {
+    let t = TempDir::new().unwrap();
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let writer = Arc::new(make_writer(&t).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let writer = Arc::new(SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap());
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .append_table("main", "t", &[batch(vec![3, 4, 5], vec![30, 40, 50])])
+        .await
+        .unwrap();
+
+    let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let deleted = ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id IN (2, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = deleted[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 2);
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (4, 40), (5, 50)]);
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let delete_snapshots: (i64, i64) =
+        sqlx::query_as("SELECT MIN(begin_snapshot), MAX(begin_snapshot) FROM ducklake_delete_file")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let inlined_end: i64 =
+        sqlx::query_scalar("SELECT end_snapshot FROM ducklake_inlined_data_1_1 WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(delete_snapshots.0, delete_snapshots.1);
+    assert_eq!(inlined_end, delete_snapshots.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_float_and_binary_view_columns_round_trip() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("double_val", DataType::Float64, true),
+        Field::new("float_val", DataType::Float32, true),
+        Field::new("payload", DataType::BinaryView, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Float64Array::from(vec![Some(1.5), None])),
+            Arc::new(Float32Array::from(vec![Some(-2.25_f32), None])),
+            Arc::new(
+                vec![Some(&[0x00_u8, 0xff][..]), None]
+                    .into_iter()
+                    .collect::<BinaryViewArray>(),
+            ),
+        ],
+    )
+    .unwrap();
+    let result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "typed", &[batch])
+        .await
+        .unwrap();
+    assert_eq!(result.files_written, 0);
+    assert_eq!(result.records_written, 2);
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id, double_val, float_val, payload FROM ducklake.main.typed ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let doubles = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let floats = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    let payloads = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .unwrap();
+    assert_eq!(doubles.value(0), 1.5);
+    assert!(doubles.is_null(1));
+    assert_eq!(floats.value(0), -2.25_f32);
+    assert!(floats.is_null(1));
+    assert_eq!(payloads.value(0), &[0x00_u8, 0xff]);
+    assert!(payloads.is_null(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamp_columns_fall_back_to_parquet() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_002)])),
+        ],
+    )
+    .unwrap();
+    let result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "events", &[batch])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.files_written, 1,
+        "a small write with a timestamp column must keep the Parquet path"
+    );
+    assert_eq!(result.records_written, 1);
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let inline_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_inlined_data_tables")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let data_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(inline_tables, 0);
+    assert_eq!(data_files, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
+    let t = TempDir::new().unwrap();
+    let writer = make_writer(&t).await;
+    let seed = Arc::new(SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap());
+    DuckLakeTableWriter::new(seed, object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    // Pin a base, then let a concurrent append publish a newer generation.
+    let stale = writer
+        .begin_write_transaction("main", "t", &cols, WriteMode::Append)
+        .unwrap();
+    let concurrent = Arc::new(SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap());
+    DuckLakeTableWriter::new(concurrent, object_store())
+        .unwrap()
+        .append_table("main", "t", &[batch(vec![3], vec![30])])
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let head_before: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let error = writer
+        .register_inlined_data(
+            stale.table_id,
+            "main",
+            "t",
+            stale.snapshot_id,
+            &[batch(vec![9], vec![90])],
+            WriteMode::Append,
+            stale.base_snapshot_id,
+            &cols,
+            &stale.column_ids,
+            &SnapshotCommitMetadata::new(),
+            Some(stale.base_snapshot_id),
+        )
+        .unwrap_err();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+
+    let head_after: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let inline_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_inlined_data_tables")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let record_count: i64 =
+        sqlx::query_scalar("SELECT record_count FROM ducklake_table_stats WHERE table_id = ?")
+            .bind(stale.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(head_after, head_before, "conflict must commit no snapshot");
+    assert_eq!(inline_tables, 0);
+    assert_eq!(record_count, 3);
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_refuses_tables_with_inlined_rows() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+
+    // Default write options: inlining stays enabled on the writable catalog.
+    let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let error = match ctx
+        .sql("UPDATE ducklake.main.t SET val = 99 WHERE id = 1")
+        .await
+    {
+        Ok(df) => df.collect().await.expect_err("UPDATE must refuse"),
+        Err(e) => e,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("UPDATE on a table with inlined rows is not supported")
+            && message.contains("flush inlined data to Parquet"),
+        "{message}"
+    );
+    // Nothing changed.
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_lineage_scan_refuses_tables_with_inlined_rows() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider)
+        .unwrap()
+        .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let error = match ctx.sql("SELECT rowid, id FROM ducklake.main.t").await {
+        Ok(df) => df.collect().await.expect_err("rowid scan must refuse"),
+        Err(e) => e,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("row-lineage (rowid) scan on a table with inlined rows is not supported")
+            && message.contains("flush inlined data to Parquet"),
+        "{message}"
+    );
+
+    // The same catalog still serves non-rowid reads, inlined rows included.
+    let batches = ctx
+        .sql("SELECT id, val FROM ducklake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crate_and_duckdb_round_trip_inlined_rows() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(10),
+        ..Default::default()
+    };
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE ducklake_snapshot
+         ADD COLUMN next_catalog_id BIGINT NOT NULL DEFAULT 1000",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE ducklake_snapshot
+         ADD COLUMN next_file_id BIGINT NOT NULL DEFAULT 1000",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE ducklake_schema ADD COLUMN schema_uuid VARCHAR")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_schema SET schema_uuid = '00000000-0000-0000-0000-000000000001'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_table ADD COLUMN table_uuid VARCHAR")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_table SET table_uuid = '00000000-0000-0000-0000-000000000002'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN file_order BIGINT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN file_format VARCHAR")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_delete_file ADD COLUMN format VARCHAR")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for ddl in [
+        "CREATE TABLE ducklake_column_mapping (mapping_id BIGINT, table_id BIGINT, type VARCHAR)",
+        "CREATE TABLE ducklake_column_tag (table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+        "CREATE TABLE ducklake_file_variant_stats (data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN, extra_stats VARCHAR)",
+        "CREATE TABLE ducklake_macro (schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT)",
+        "CREATE TABLE ducklake_macro_impl (macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, sql VARCHAR, type VARCHAR)",
+        "CREATE TABLE ducklake_macro_parameters (macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR)",
+        "CREATE TABLE ducklake_name_mapping (mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN)",
+        "CREATE TABLE ducklake_tag (object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+        "CREATE TABLE IF NOT EXISTS ducklake_view (view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, sql VARCHAR, column_aliases VARCHAR)",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+
+    let attach = format!(
+        "LOAD ducklake; LOAD sqlite; ATTACH 'ducklake:sqlite:{}' AS lake;",
+        t.path().join("test.db").display()
+    );
+    let output = Command::new("duckdb")
+        .args([
+            "-csv",
+            "-noheader",
+            ":memory:",
+            "-c",
+            &format!("{attach} SELECT id, val FROM lake.main.t ORDER BY id;"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "DuckDB read failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "1,10\n2,20\n");
+
+    let output = Command::new("duckdb")
+        .args([":memory:", "-c", &format!("{attach} INSERT INTO lake.main.t VALUES (3, 30);")])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "DuckDB insert failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
 }

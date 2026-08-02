@@ -10,17 +10,221 @@ use crate::maintenance::{
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, MetadataWriter, SnapshotCommitMetadata, WriteMode, WriteSetupResult,
-    assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, SnapshotCommitMetadata, WriteMode,
+    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, table_write_changes,
     top_level_column_ids, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
+use sqlx::QueryBuilder;
 use sqlx::Row;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{Sqlite, SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn inlined_sqlite_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => "BIGINT",
+        // DOUBLE has numeric affinity, so a bound f64 stays REAL; a VARCHAR
+        // column's TEXT affinity would coerce it to text, which the inline
+        // reader (which expects REAL) cannot decode.
+        DataType::Float32 | DataType::Float64 => "DOUBLE",
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BLOB",
+        DataType::FixedSizeBinary(size) if *size != 16 => "BLOB",
+        _ => "VARCHAR",
+    }
+}
+
+/// The column types the SQLite inline WRITE path can store such that the SQLite
+/// inline READ path (`build_inlined_batch`) decodes them back exactly. A write
+/// containing any other column type keeps the Parquet path.
+fn sqlite_type_inlines(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::BinaryView
+    )
+}
+
+fn push_inlined_sqlite_value(
+    query: &mut QueryBuilder<Sqlite>,
+    array: &dyn Array,
+    row: usize,
+) -> Result<()> {
+    if array.is_null(row) {
+        query.push_bind(Option::<String>::None);
+        return Ok(());
+    }
+
+    macro_rules! signed {
+        ($array:ty) => {{
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row) as i64,
+            );
+        }};
+    }
+    macro_rules! unsigned {
+        ($array:ty) => {{
+            let value = array
+                .as_any()
+                .downcast_ref::<$array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(i64::try_from(value).map_err(|_| {
+                crate::error::DuckLakeError::Unsupported(format!(
+                    "SQLite inlined data cannot represent unsigned value {value}"
+                ))
+            })?);
+        }};
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row),
+            );
+        },
+        DataType::Int8 => signed!(Int8Array),
+        DataType::Int16 => signed!(Int16Array),
+        DataType::Int32 => signed!(Int32Array),
+        DataType::Int64 => signed!(Int64Array),
+        DataType::UInt8 => unsigned!(UInt8Array),
+        DataType::UInt16 => unsigned!(UInt16Array),
+        DataType::UInt32 => unsigned!(UInt32Array),
+        DataType::UInt64 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_string(),
+            );
+        },
+        DataType::Float32 => {
+            query.push_bind(f64::from(
+                array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row),
+            ));
+        },
+        DataType::Float64 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row),
+            );
+        },
+        DataType::Utf8 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_owned(),
+            );
+        },
+        DataType::LargeUtf8 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_owned(),
+            );
+        },
+        DataType::Binary => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::LargeBinary => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::BinaryView => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::FixedSizeBinary(size) if *size != 16 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        _ => {
+            query.push_bind(crate::metadata_writer::inlined_text_value(array, row)?);
+        },
+    };
+    Ok(())
+}
 
 /// Render a slice of ids as a SQL `IN (...)` body. Safe to interpolate because
 /// the values are `i64` (no injection surface) — same approach the upstream
@@ -170,6 +374,12 @@ CREATE TABLE IF NOT EXISTS ducklake_table_stats (
     record_count INTEGER NOT NULL DEFAULT 0,
     next_row_id INTEGER NOT NULL DEFAULT 0,
     file_size_bytes INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+    table_id INTEGER NOT NULL,
+    table_name VARCHAR NOT NULL,
+    schema_version INTEGER NOT NULL
 );
 
 -- Per-file, per-column statistics (DuckLake spec zone maps). Powers file-level
@@ -1088,6 +1298,29 @@ async fn detect_replace_conflict(
              snapshot {base_snapshot}; aborting (retry the write against the new generation)"
         )));
     }
+    let inlined_tables =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in inlined_tables {
+        let table_name: String = row.try_get(0)?;
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE begin_snapshot > ? OR end_snapshot > ? LIMIT 1",
+            quote_ident(&table_name)
+        );
+        let conflict: Option<i64> = sqlx::query_scalar(AssertSqlSafe(sql))
+            .bind(base_snapshot)
+            .bind(base_snapshot)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if conflict.is_some() {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "Replace on table {table_id} conflicts with inlined data committed since \
+                 snapshot {base_snapshot}; aborting"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1111,12 +1344,202 @@ async fn retire_prior_generation(
     .execute(&mut **tx)
     .await?;
 
+    let inlined_tables =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in inlined_tables {
+        let table_name: String = row.try_get(0)?;
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = ? \
+             WHERE end_snapshot IS NULL AND begin_snapshot < ?",
+            quote_ident(&table_name)
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
     sqlx::query(
         "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0 WHERE table_id = ?",
     )
     .bind(table_id)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// Whether `snapshot_id` ended prior rows of the table — Parquet files or
+/// inlined rows — i.e. a Replace actually replaced existing data.
+async fn replace_ended_prior_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<bool> {
+    let replaced: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_data_file
+            WHERE table_id = ? AND end_snapshot = ?
+         )",
+    )
+    .bind(table_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if replaced {
+        return Ok(true);
+    }
+    for table_name in inlined_table_names(tx, table_id).await? {
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot = ?)",
+            quote_ident(&table_name)
+        );
+        if sqlx::query_scalar(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn inlined_table_names(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<Vec<String>> {
+    let rows =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    rows.into_iter().map(|row| Ok(row.try_get(0)?)).collect()
+}
+
+async fn live_inlined_row_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<i64> {
+    let mut total = 0;
+    for table_name in inlined_table_names(tx, table_id).await? {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE end_snapshot IS NULL",
+            quote_ident(&table_name)
+        );
+        total += sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
+            .fetch_one(&mut **tx)
+            .await?;
+    }
+    Ok(total)
+}
+
+async fn apply_positional_deletes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    deletes: &[DeleteFileEntry],
+) -> Result<()> {
+    for entry in deletes {
+        let target_live: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM ducklake_data_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(entry.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if target_live.is_none() {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "DELETE on data file {} could not commit: the file is no longer live since \
+                 snapshot {base_snapshot}",
+                entry.data_file_id
+            )));
+        }
+        let current_prev: Option<i64> = sqlx::query_scalar(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(entry.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if current_prev != entry.expected_prev_delete_file {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "DELETE on data file {} could not commit: its live delete file changed from \
+                 {:?} to {current_prev:?} since snapshot {base_snapshot}",
+                entry.data_file_id, entry.expected_prev_delete_file
+            )));
+        }
+        if let Some(previous) = entry.expected_prev_delete_file {
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE delete_file_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(previous)
+            .execute(&mut **tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO ducklake_delete_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  footer_size, delete_count, begin_snapshot)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(entry.data_file_id)
+        .bind(table_id)
+        .bind(&entry.delete.path)
+        .bind(entry.delete.path_is_relative)
+        .bind(entry.delete.file_size_bytes)
+        .bind(entry.delete.footer_size)
+        .bind(entry.delete.delete_count)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn apply_inlined_deletes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    rows: &[InlinedRowRef],
+) -> Result<()> {
+    let registered = inlined_table_names(tx, table_id)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    for row in rows {
+        if !registered.contains(&row.table_name) {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} belongs to an unregistered table '{}'",
+                row.row_id, row.table_name
+            )));
+        }
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = ? \
+             WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
+            quote_ident(&row.table_name)
+        );
+        let affected = sqlx::query(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .bind(row.row_id)
+            .bind(base_snapshot)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        if affected != 1 {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
+                row.row_id, row.table_name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2477,16 +2900,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let replaced_existing_data = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM ducklake_data_file
-                    WHERE table_id = ? AND end_snapshot = ?
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
 
@@ -2650,16 +3065,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            let replaced_existing_data = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM ducklake_data_file
-                    WHERE table_id = ? AND end_snapshot = ?
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             let schema_id: i64 =
@@ -2668,6 +3075,177 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        schema
+            .fields()
+            .iter()
+            .all(|field| sqlite_type_inlines(field.data_type()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_inlined_data(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        batches: &[RecordBatch],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        block_on(async {
+            let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            if record_count == 0 {
+                return Err(crate::DuckLakeError::InvalidConfig(
+                    "register_inlined_data: batches must contain at least one row".to_string(),
+                ));
+            }
+            if batches
+                .iter()
+                .any(|batch| batch.num_columns() != columns.len())
+            {
+                return Err(crate::DuckLakeError::InvalidConfig(
+                    "register_inlined_data: batch schema does not match table columns".to_string(),
+                ));
+            }
+
+            let mut tx = self.pool.begin().await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
+            let schema_version: i64 = sqlx::query_scalar(
+                "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let physical_name = format!("ducklake_inlined_data_{table_id}_{schema_version}");
+
+            let mut ddl = format!(
+                "CREATE TABLE IF NOT EXISTS {} (\
+                 row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+                quote_ident(&physical_name)
+            );
+            for (field, column) in batches[0].schema().fields().iter().zip(columns) {
+                ddl.push_str(", ");
+                ddl.push_str(&quote_ident(column.name()));
+                ddl.push(' ');
+                ddl.push_str(inlined_sqlite_type(field.data_type()));
+            }
+            ddl.push(')');
+            sqlx::query(AssertSqlSafe(ddl)).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO ducklake_inlined_data_tables
+                     (table_id, table_name, schema_version)
+                 SELECT ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_inlined_data_tables
+                     WHERE table_id = ? AND schema_version = ?)",
+            )
+            .bind(table_id)
+            .bind(&physical_name)
+            .bind(schema_version)
+            .bind(table_id)
+            .bind(schema_version)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let mut row_id: i64 = sqlx::query_scalar(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let column_list = columns
+                .iter()
+                .map(|column| quote_ident(column.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for batch in batches {
+                for batch_row in 0..batch.num_rows() {
+                    let mut query = QueryBuilder::<Sqlite>::new(format!(
+                        "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) VALUES (",
+                        quote_ident(&physical_name),
+                        column_list
+                    ));
+                    query.push_bind(row_id);
+                    query.push(", ").push_bind(snapshot_id);
+                    query.push(", NULL");
+                    for array in batch.columns() {
+                        query.push(", ");
+                        push_inlined_sqlite_value(&mut query, array.as_ref(), batch_row)?;
+                    }
+                    query.push(')');
+                    query.build().execute(&mut *tx).await?;
+                    row_id += 1;
+                }
+            }
+
+            let record_count = i64::try_from(record_count).map_err(|_| {
+                crate::DuckLakeError::InvalidConfig(
+                    "register_inlined_data: record count exceeds i64".to_string(),
+                )
+            })?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id = next_row_id + ?, record_count = record_count + ?
+                 WHERE table_id = ?",
+            )
+            .bind(record_count)
+            .bind(record_count)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            // Append to the ledger row finalize_snapshot seeded (which may already
+            // carry created_schema:/created_table: entries) instead of replacing
+            // it, and record a Replace over prior data — Parquet or inlined — as
+            // delete + insert, the same semantics the Parquet path records.
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
             Ok(CommitIds {
                 snapshot_id,
@@ -3012,16 +3590,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM ducklake_data_file
-                    WHERE table_id = ? AND end_snapshot = ?
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -3271,16 +3841,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM ducklake_data_file
-                    WHERE table_id = ? AND end_snapshot = ?
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -3417,6 +3979,175 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn commit_inlined_deletes(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        base_snapshot: i64,
+        rows: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        if rows.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_inlined_deletes requires at least one row".to_string(),
+            ));
+        }
+        if rows.iter().collect::<std::collections::HashSet<_>>().len() != rows.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_inlined_deletes contains duplicate rows".to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let registered = inlined_table_names(&mut tx, table_id)
+                .await?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            for row in rows {
+                if !registered.contains(&row.table_name) {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "inlined row {} belongs to an unregistered table '{}'",
+                        row.row_id, row.table_name
+                    )));
+                }
+                let sql = format!(
+                    "UPDATE {} SET end_snapshot = ? \
+                     WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
+                    quote_ident(&row.table_name)
+                );
+                let affected = sqlx::query(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .bind(row.row_id)
+                    .bind(base_snapshot)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                if affected != 1 {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
+                        row.row_id, row.table_name
+                    )));
+                }
+            }
+            let deleted = i64::try_from(rows.len()).map_err(|_| {
+                crate::DuckLakeError::InvalidConfig(
+                    "commit_inlined_deletes row count exceeds i64".to_string(),
+                )
+            })?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = MAX(record_count - ?, 0)
+                 WHERE table_id = ?",
+            )
+            .bind(deleted)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn commit_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        positional: &[DeleteFileEntry],
+        inlined: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        if inlined.is_empty() {
+            return self.commit_positional_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                positional,
+            );
+        }
+        if positional.is_empty() {
+            return self.commit_inlined_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                inlined,
+            );
+        }
+        validate_delete_entries(WriteMode::Append, positional)?;
+        if inlined
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != inlined.len()
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_deletes contains duplicate inlined rows".to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            apply_positional_deletes(&mut tx, table_id, snapshot_id, base_snapshot, positional)
+                .await?;
+            apply_inlined_deletes(&mut tx, table_id, snapshot_id, base_snapshot, inlined).await?;
+            if !inlined.is_empty() {
+                let deleted = i64::try_from(inlined.len()).map_err(|_| {
+                    crate::DuckLakeError::InvalidConfig(
+                        "commit_deletes row count exceeds i64".to_string(),
+                    )
+                })?;
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = MAX(record_count - ?, 0)
+                     WHERE table_id = ?",
+                )
+                .bind(deleted)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
             Ok(CommitIds {
                 snapshot_id,
@@ -3855,7 +4586,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_optional(&mut *tx)
             .await?;
-            if has_live_data.is_none() {
+            let live_inlined = live_inlined_row_count(&mut tx, table_id).await?;
+            if has_live_data.is_none() && live_inlined == 0 {
                 return Ok(0);
             }
 
@@ -3884,6 +4616,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            for table_name in inlined_table_names(&mut tx, table_id).await? {
+                let sql = format!(
+                    "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
+                    quote_ident(&table_name)
+                );
+                sqlx::query(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             sqlx::query(
                 "UPDATE ducklake_delete_file SET end_snapshot = ?
                  WHERE table_id = ? AND end_snapshot IS NULL",
@@ -3945,16 +4687,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 base_snapshot,
             )
             .await?;
-            let replaced_existing_data = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM ducklake_data_file
-                    WHERE table_id = ? AND end_snapshot = ?
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let replaced_existing_data =
+                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(
                 &mut tx,
@@ -4316,6 +5050,22 @@ impl MetadataWriter for SqliteMetadataWriter {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn sqlite_inlined_types_follow_ducklake_encodings() {
+        assert_eq!(inlined_sqlite_type(&DataType::Int32), "BIGINT");
+        assert_eq!(inlined_sqlite_type(&DataType::UInt64), "VARCHAR");
+        assert_eq!(inlined_sqlite_type(&DataType::Float64), "DOUBLE");
+        assert_eq!(inlined_sqlite_type(&DataType::Float32), "DOUBLE");
+        assert_eq!(inlined_sqlite_type(&DataType::Binary), "BLOB");
+        assert_eq!(inlined_sqlite_type(&DataType::BinaryView), "BLOB");
+        assert_eq!(
+            inlined_sqlite_type(&DataType::FixedSizeBinary(16)),
+            "VARCHAR"
+        );
+        assert_eq!(inlined_sqlite_type(&DataType::FixedSizeBinary(32)), "BLOB");
+        assert_eq!(inlined_sqlite_type(&DataType::Date32), "VARCHAR");
+    }
 
     async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
         let temp_dir = TempDir::new().unwrap();

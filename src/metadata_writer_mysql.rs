@@ -34,17 +34,187 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
-    SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    quote_snapshot_name, quote_snapshot_table, table_write_changes, top_level_column_ids,
-    validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, InlinedRowRef,
+    MetadataWriter, SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, quote_snapshot_name, quote_snapshot_table, table_write_changes,
+    top_level_column_ids, validate_name,
 };
 use crate::partition::PartitionTransform;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
+    UInt16Array, UInt32Array,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use sqlx::Row;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::{MySql, MySqlPool, MySqlPoolOptions};
+use sqlx::{AssertSqlSafe, QueryBuilder};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn inlined_mysql_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => "BIGINT",
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "LONGBLOB",
+        DataType::FixedSizeBinary(size) if *size != 16 => "LONGBLOB",
+        _ => "LONGTEXT",
+    }
+}
+
+/// The column types the MySQL inline WRITE path can store such that the shared
+/// inline READ path (`inlined_text_projection` + `parse_inlined_rows`) decodes
+/// them back exactly: numeric/boolean columns round-trip through
+/// `CAST(.. AS CHAR)`, strings and text-stored floats verbatim through
+/// LONGTEXT, and binary columns through `HEX(..)`. Temporal, decimal, uuid,
+/// interval, and fixed-size binary columns are excluded; a write containing any
+/// other column type keeps the Parquet path.
+fn mysql_type_inlines(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::BinaryView
+    )
+}
+
+fn push_inlined_mysql_value(
+    query: &mut QueryBuilder<MySql>,
+    array: &dyn Array,
+    row: usize,
+) -> Result<()> {
+    if array.is_null(row) {
+        query.push_bind(Option::<String>::None);
+        return Ok(());
+    }
+    macro_rules! signed {
+        ($array:ty) => {{
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row) as i64,
+            );
+        }};
+    }
+    macro_rules! unsigned {
+        ($array:ty) => {{
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row) as i64,
+            );
+        }};
+    }
+    match array.data_type() {
+        DataType::Boolean => {
+            let value = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(i64::from(value));
+        },
+        DataType::Int8 => signed!(Int8Array),
+        DataType::Int16 => signed!(Int16Array),
+        DataType::Int32 => signed!(Int32Array),
+        DataType::Int64 => signed!(Int64Array),
+        DataType::UInt8 => unsigned!(UInt8Array),
+        DataType::UInt16 => unsigned!(UInt16Array),
+        DataType::UInt32 => unsigned!(UInt32Array),
+        DataType::Utf8 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_owned(),
+            );
+        },
+        DataType::LargeUtf8 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_owned(),
+            );
+        },
+        DataType::Binary => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::LargeBinary => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::BinaryView => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        DataType::FixedSizeBinary(size) if *size != 16 => {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row)
+                    .to_vec(),
+            );
+        },
+        _ => {
+            query.push_bind(crate::metadata_writer::inlined_text_value(array, row)?);
+        },
+    }
+    Ok(())
+}
 
 /// The DuckLake v1.0 catalog tables in MySQL dialect, one `CREATE TABLE` per
 /// entry. sqlx runs each `query()` as a single prepared statement on MySQL
@@ -154,6 +324,18 @@ const SQL_CREATE_TABLES: &[&str] = &[
         record_count BIGINT NOT NULL DEFAULT 0,
         next_row_id BIGINT NOT NULL DEFAULT 0,
         file_size_bytes BIGINT NOT NULL DEFAULT 0
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+        table_id BIGINT NOT NULL,
+        table_name VARCHAR(1024) NOT NULL,
+        schema_version BIGINT NOT NULL
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+        snapshot_id BIGINT NOT NULL PRIMARY KEY,
+        changes_made TEXT NOT NULL,
+        author VARCHAR(1024),
+        commit_message TEXT,
+        commit_extra_info TEXT
     ) ENGINE = InnoDB"#,
     // Per-file, per-column zone maps (DuckLake spec) — powers file pruning.
     // min/max use TEXT (bounds can be up to the encoder's length cap). Column
@@ -369,6 +551,30 @@ async fn detect_replace_conflict(
              snapshot {base_snapshot}; aborting (retry the write against the new generation)"
         )));
     }
+    let inlined_tables =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in inlined_tables {
+        let table_name: String = row.try_get(0)?;
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE begin_snapshot > ? OR end_snapshot > ? LIMIT 1",
+            quote_ident(&table_name)
+        );
+        if sqlx::query(AssertSqlSafe(sql))
+            .bind(base_snapshot)
+            .bind(base_snapshot)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
+        {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "Replace on table {table_id} conflicts with inlined data committed since \
+                 snapshot {base_snapshot}; aborting"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -390,6 +596,25 @@ async fn retire_prior_generation(
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
+
+    let inlined_tables =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in inlined_tables {
+        let table_name: String = row.try_get(0)?;
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = ? \
+             WHERE end_snapshot IS NULL AND begin_snapshot < ?",
+            quote_ident(&table_name)
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
+    }
 
     sqlx::query(
         "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0 WHERE table_id = ?",
@@ -502,7 +727,7 @@ async fn record_table_write_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    let replaced_existing_data: bool = sqlx::query_scalar(
+    let mut replaced_existing_data: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
             WHERE table_id = ? AND end_snapshot = ?
@@ -512,6 +737,29 @@ async fn record_table_write_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
+    if !replaced_existing_data {
+        // A Replace over inline-only prior data ends inline rows, not files.
+        let inlined_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for inlined_table in inlined_tables {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot = ?)",
+                quote_ident(&inlined_table)
+            );
+            if sqlx::query_scalar(AssertSqlSafe(sql))
+                .bind(snapshot_id)
+                .fetch_one(&mut **tx)
+                .await?
+            {
+                replaced_existing_data = true;
+                break;
+            }
+        }
+    }
 
     let mut changes = Vec::new();
     if schema_begin_snapshot == snapshot_id {
@@ -1420,6 +1668,297 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        schema
+            .fields()
+            .iter()
+            .all(|field| mysql_type_inlines(field.data_type()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_inlined_data(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        batches: &[RecordBatch],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        if record_count == 0 {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_inlined_data: batches must contain at least one row".to_string(),
+            ));
+        }
+        if batches
+            .iter()
+            .any(|batch| batch.num_columns() != columns.len())
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_inlined_data: batch schema does not match table columns".to_string(),
+            ));
+        }
+
+        block_on(async {
+            // MySQL DDL implicitly commits the surrounding transaction, so the
+            // physical inline table must exist BEFORE the write transaction
+            // opens (CREATE TABLE IF NOT EXISTS is idempotent, and an existing
+            // physical table without registry rows is inert). Its name embeds
+            // the schema version the commit will allocate, which is only known
+            // inside the transaction — predict it, and when the commit resolves
+            // a different version (a schema change in this write), roll back,
+            // create the table for the observed version, and retry once.
+            let mut create_for: Option<i64> = None;
+            let mut settled = None;
+            for _ in 0..3 {
+                let version_to_create = match create_for {
+                    Some(version) => version,
+                    None => {
+                        sqlx::query_scalar(
+                            "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot",
+                        )
+                        .fetch_one(&self.pool)
+                        .await?
+                    },
+                };
+                let physical_name = format!("ducklake_inlined_data_{table_id}_{version_to_create}");
+                let mut ddl = format!(
+                    "CREATE TABLE IF NOT EXISTS {} (\
+                     row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+                    quote_ident(&physical_name)
+                );
+                for (column, field) in columns.iter().zip(batches[0].schema().fields()) {
+                    ddl.push_str(", ");
+                    ddl.push_str(&quote_ident(column.name()));
+                    ddl.push(' ');
+                    ddl.push_str(inlined_mysql_type(field.data_type()));
+                }
+                ddl.push_str(") ENGINE = InnoDB");
+                sqlx::query(AssertSqlSafe(ddl)).execute(&self.pool).await?;
+
+                let mut tx = self.pool.begin().await?;
+                let snapshot_id =
+                    finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                        .await?;
+                if mode != WriteMode::Replace
+                    && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+                {
+                    detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+                }
+                let schema_version: i64 = sqlx::query_scalar(
+                    "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+                )
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if schema_version != version_to_create {
+                    tx.rollback().await?;
+                    create_for = Some(schema_version);
+                    continue;
+                }
+                settled = Some((tx, snapshot_id, schema_version, physical_name));
+                break;
+            }
+            let Some((mut tx, snapshot_id, schema_version, physical_name)) = settled else {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "register_inlined_data on table {table_id} could not settle on a schema \
+                     version for the inline table; retry the write"
+                )));
+            };
+            sqlx::query(
+                "INSERT INTO ducklake_inlined_data_tables
+                     (table_id, table_name, schema_version)
+                 SELECT ?, ?, ? FROM DUAL
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_inlined_data_tables
+                     WHERE table_id = ? AND schema_version = ?)",
+            )
+            .bind(table_id)
+            .bind(&physical_name)
+            .bind(schema_version)
+            .bind(table_id)
+            .bind(schema_version)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let mut row_id: i64 = sqlx::query_scalar(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let column_list = columns
+                .iter()
+                .map(|column| quote_ident(column.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for batch in batches {
+                for batch_row in 0..batch.num_rows() {
+                    let mut query = QueryBuilder::<MySql>::new(format!(
+                        "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) VALUES (",
+                        quote_ident(&physical_name),
+                        column_list
+                    ));
+                    query.push_bind(row_id);
+                    query.push(", ").push_bind(snapshot_id);
+                    query.push(", NULL");
+                    for array in batch.columns() {
+                        query.push(", ");
+                        push_inlined_mysql_value(&mut query, array.as_ref(), batch_row)?;
+                    }
+                    query.push(')');
+                    query.build().execute(&mut *tx).await?;
+                    row_id += 1;
+                }
+            }
+
+            let record_count = i64::try_from(record_count).map_err(|_| {
+                crate::DuckLakeError::InvalidConfig(
+                    "register_inlined_data: record count exceeds i64".to_string(),
+                )
+            })?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id = next_row_id + ?, record_count = record_count + ?
+                 WHERE table_id = ?",
+            )
+            .bind(record_count)
+            .bind(record_count)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            // The same composed ledger recording the Parquet path uses: DDL
+            // entries plus the write change, appended rather than clobbered.
+            record_table_write_changes(
+                &mut tx,
+                snapshot_id,
+                table_id,
+                schema_name,
+                table_name,
+                mode,
+                commit_metadata,
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn commit_inlined_deletes(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        base_snapshot: i64,
+        rows: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        if rows.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_inlined_deletes requires at least one row".to_string(),
+            ));
+        }
+        if rows.iter().collect::<std::collections::HashSet<_>>().len() != rows.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_inlined_deletes contains duplicate rows".to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let registered = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get(0))
+            .collect::<std::result::Result<std::collections::HashSet<String>, _>>()?;
+            for row in rows {
+                if !registered.contains(&row.table_name) {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "inlined row {} belongs to an unregistered table '{}'",
+                        row.row_id, row.table_name
+                    )));
+                }
+                let sql = format!(
+                    "UPDATE {} SET end_snapshot = ? \
+                     WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
+                    quote_ident(&row.table_name)
+                );
+                let affected = sqlx::query(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .bind(row.row_id)
+                    .bind(base_snapshot)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                if affected != 1 {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
+                        row.row_id, row.table_name
+                    )));
+                }
+            }
+            let deleted = i64::try_from(rows.len()).map_err(|_| {
+                crate::DuckLakeError::InvalidConfig(
+                    "commit_inlined_deletes row count exceeds i64".to_string(),
+                )
+            })?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = GREATEST(record_count - ?, 0) WHERE table_id = ?",
+            )
+            .bind(deleted)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
     fn set_partition_spec(
         &self,
         table_id: i64,
@@ -2110,5 +2649,27 @@ impl MetadataWriter for MySqlMetadataWriter {
                 field_ids,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_inlined_types_follow_sqlite_style_encodings() {
+        assert_eq!(inlined_mysql_type(&DataType::Int32), "BIGINT");
+        assert_eq!(inlined_mysql_type(&DataType::UInt64), "LONGTEXT");
+        assert_eq!(inlined_mysql_type(&DataType::Float64), "LONGTEXT");
+        assert_eq!(inlined_mysql_type(&DataType::Binary), "LONGBLOB");
+        assert_eq!(
+            inlined_mysql_type(&DataType::FixedSizeBinary(16)),
+            "LONGTEXT"
+        );
+        assert_eq!(
+            inlined_mysql_type(&DataType::FixedSizeBinary(32)),
+            "LONGBLOB"
+        );
+        assert_eq!(inlined_mysql_type(&DataType::Date32), "LONGTEXT");
     }
 }

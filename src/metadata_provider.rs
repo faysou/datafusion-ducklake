@@ -815,6 +815,17 @@ pub struct DuckLakeNameMapping {
     pub entries: Vec<DuckLakeNameMappingEntry>,
 }
 
+/// One physical inlined-data table's visible rows with their stable row ids.
+#[derive(Debug, Clone)]
+pub struct DuckLakeInlinedData {
+    /// Catalog physical table that owns the rows.
+    pub table_name: String,
+    /// Stable DuckLake row ids, aligned with `batch` rows.
+    pub row_ids: Vec<i64>,
+    /// Physical table columns in catalog order.
+    pub batch: arrow::record_batch::RecordBatch,
+}
+
 impl DuckLakeTableColumn {
     pub fn new(
         column_id: i64,
@@ -1575,6 +1586,18 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _table_id: i64,
         _snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
+        Ok(Vec::new())
+    }
+
+    /// Read visible inlined rows together with their physical table and stable
+    /// row ids for mutation planning. Backends that only support read-only
+    /// inlined scans may keep the empty default.
+    fn get_inlined_data_with_row_ids(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
         Ok(Vec::new())
     }
 

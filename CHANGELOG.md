@@ -10,9 +10,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add read-only DuckLake views across metadata backends and writer-compatible view metadata (#264).
+- Scoped DuckLake writer settings now control compression, row groups, file
+  rollover, sorting, partition paths, and the inclusive
+  `data_inlining_row_limit`. Small writes can stay in the metadata catalog with
+  stable row IDs, snapshot visibility, table statistics, mixed positional and
+  inline deletes, and DuckDB extension interoperability.
+
+### Changed
+
+- Small writes at or below `data_inlining_row_limit` inline only when the
+  writer's schema-aware `supports_data_inlining` probe accepts the schema;
+  otherwise they fall back to Parquet instead of failing. The standard
+  single-catalog PostgreSQL writer and external `MetadataWriter`
+  implementations keep working for small writes, and column types a backend
+  cannot round-trip through its inline encodings stay on Parquet (#272).
+- SQL `UPDATE` and row-lineage (`rowid`) scans on a table with visible inlined
+  rows refuse with a clear error instead of silently updating zero rows or
+  returning empty lineage; flush the rows to Parquet or disable inlining at
+  write time to use them (#272).
 
 ### Fixed
 
+- SQLite and MySQL inline value encodings round-trip exactly: floats are
+  stored as `DOUBLE` and binary columns, including `blob`/`BinaryView`, as
+  `BLOB`. Bytes previously read back as the hex string of themselves, and
+  SQLite committed timestamp and float encodings its own inline reader could
+  not decode (#272).
+- Inline commits honor `expected_base_snapshot_id`, `commit_metadata`, and the
+  partition-spec conflict check, including the inline branch of partitioned
+  small writes, so optimistic concurrency is no longer silently disabled for
+  small writes (#272).
+- `register_inlined_data` appends to the snapshot's `changes_made` ledger
+  instead of overwriting `created_schema:`/`created_table:` entries, and a
+  Replace that ended prior data — Parquet or inlined — records delete plus
+  insert on every commit path (#272).
+- MySQL inline-table DDL runs before the write transaction opens, so MySQL's
+  implicit DDL commit can no longer split an inline write into several
+  effective commits or leave a partially committed snapshot after a mid-write
+  failure (#272).
 - `files_matching` prunes a data file that carries a delete file. Its recorded
   bounds are marked inexact for readers that apply deletes, and the pruning view
   uses only exact ones, so the first mutation to write a delete file stopped that

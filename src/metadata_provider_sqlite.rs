@@ -3,8 +3,8 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
-    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, MetadataProvider, MetadataSetting, SQL_GET_FILE_PARTITION_VALUES,
     SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS,
@@ -15,8 +15,9 @@ use crate::metadata_provider::{
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use sqlx::AssertSqlSafe;
@@ -129,7 +130,23 @@ fn build_inlined_batch(
             DataType::UInt8 => ints!(UInt8Array, u8),
             DataType::UInt16 => ints!(UInt16Array, u16),
             DataType::UInt32 => ints!(UInt32Array, u32),
-            DataType::UInt64 => ints!(UInt64Array, u64),
+            DataType::UInt64 => {
+                let mut values = Vec::with_capacity(n);
+                for row in rows {
+                    let value = row.try_get::<Option<String>, _>(name)?;
+                    values.push(
+                        value
+                            .map(|value| value.parse::<u64>())
+                            .transpose()
+                            .map_err(|e| {
+                                crate::DuckLakeError::InvalidConfig(format!(
+                                    "invalid inlined UInt64 value for column '{name}': {e}"
+                                ))
+                            })?,
+                    );
+                }
+                Arc::new(UInt64Array::from(values)) as ArrayRef
+            },
             DataType::Float32 => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
@@ -151,6 +168,13 @@ fn build_inlined_batch(
                 }
                 Arc::new(arrow::array::StringArray::from(b)) as ArrayRef
             },
+            DataType::Utf8View => {
+                let mut values: Vec<Option<String>> = Vec::with_capacity(n);
+                for row in rows {
+                    values.push(row.try_get::<Option<String>, _>(name)?);
+                }
+                Arc::new(values.into_iter().collect::<StringViewArray>()) as ArrayRef
+            },
             DataType::Boolean => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
@@ -166,6 +190,13 @@ fn build_inlined_batch(
                 Arc::new(BinaryArray::from(
                     b.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
                 )) as ArrayRef
+            },
+            DataType::BinaryView => {
+                let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+                for row in rows {
+                    values.push(row.try_get::<Option<Vec<u8>>, _>(name)?);
+                }
+                Arc::new(values.into_iter().collect::<BinaryViewArray>()) as ArrayRef
             },
             other => {
                 return Err(crate::error::DuckLakeError::Unsupported(format!(
@@ -1262,6 +1293,81 @@ impl MetadataProvider for SqliteMetadataProvider {
                 Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
+        })
+    }
+
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let regs = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+            for reg in regs {
+                let physical_name: String = reg.try_get("table_name")?;
+                if !physical_name.starts_with("ducklake_inlined_data_")
+                    || !physical_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let info = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT name FROM pragma_table_info({})",
+                    format_args!("'{}'", physical_name.replace('\'', "''"))
+                )))
+                .fetch_all(&self.pool)
+                .await?;
+                let present: HashSet<String> = info
+                    .iter()
+                    .filter_map(|row| row.try_get::<String, _>("name").ok())
+                    .collect();
+                let projected = columns
+                    .iter()
+                    .filter(|column| present.contains(column.column_name.as_str()))
+                    .map(|column| quote_ident(&column.column_name))
+                    .collect::<Vec<_>>();
+                let select_list = if projected.is_empty() {
+                    "row_id".to_string()
+                } else {
+                    format!("row_id, {}", projected.join(", "))
+                };
+                let sql = format!(
+                    "SELECT {select_list} FROM {} \
+                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                     ORDER BY row_id",
+                    quote_ident(&physical_name)
+                );
+                let rows = sqlx::query(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let row_ids = rows
+                    .iter()
+                    .map(|row| row.try_get("row_id"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                batches.push(DuckLakeInlinedData {
+                    table_name: physical_name,
+                    row_ids,
+                    batch: build_inlined_batch(&schema, columns, &present, &rows)?,
+                });
+            }
+            Ok(batches)
         })
     }
 

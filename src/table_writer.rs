@@ -60,6 +60,9 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 /// parquet-default row groups, [`DEFAULT_TARGET_FILE_SIZE`] rollover).
 #[derive(Debug, Clone, Default)]
 pub struct DuckLakeWriteOptions {
+    /// Maximum rows written into catalog-backed inlined storage. `Some(0)`
+    /// disables inlining; `None` leaves direct writer calls on the Parquet path.
+    pub data_inlining_row_limit: Option<usize>,
     /// Parquet compression codec; `None` = uncompressed.
     pub compression: Option<Compression>,
     /// Max rows per row group; `None` = parquet default.
@@ -90,6 +93,7 @@ impl DuckLakeWriteOptions {
             .unwrap_or("snappy");
 
         Ok(Self {
+            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(10))?,
             compression: Some(setting_compression(compression_name, compression_level)?),
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
             max_row_group_bytes: setting_size(settings, "parquet_row_group_size_bytes", None)?,
@@ -106,6 +110,9 @@ impl DuckLakeWriteOptions {
     }
 
     pub(crate) fn with_overrides(mut self, overrides: &Self) -> Self {
+        if overrides.data_inlining_row_limit.is_some() {
+            self.data_inlining_row_limit = overrides.data_inlining_row_limit;
+        }
         if overrides.compression.is_some() {
             self.compression = overrides.compression;
         }
@@ -331,6 +338,7 @@ pub struct DuckLakeTableWriter {
     /// Defaults to [`DEFAULT_MAX_OPEN_PARTITIONS`]; override via
     /// [`DuckLakeTableWriter::with_max_open_partitions`].
     max_open_partitions: usize,
+    data_inlining_row_limit: Option<usize>,
     sort_on_insert: bool,
     hive_file_pattern: bool,
 }
@@ -352,6 +360,7 @@ impl DuckLakeTableWriter {
             max_row_group_bytes: None,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
+            data_inlining_row_limit: None,
             sort_on_insert: true,
             hive_file_pattern: true,
         })
@@ -409,6 +418,9 @@ impl DuckLakeTableWriter {
     /// target, open-partition cap). Each field overrides the corresponding setting
     /// only when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
+        if let Some(limit) = options.data_inlining_row_limit {
+            self.data_inlining_row_limit = Some(limit);
+        }
         if let Some(compression) = options.compression {
             self.compression = compression;
         }
@@ -1187,21 +1199,20 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids =
-            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let records_written: usize = groups
+            .iter()
+            .flat_map(|(_, batches)| batches)
+            .map(RecordBatch::num_rows)
+            .sum();
 
         // Validate the caller's assignment against the live spec BEFORE writing
-        // anything, so a bad one costs no uploads. A wrong arity or an unparseable
-        // value would otherwise be persisted and then used as an exact pruning
-        // bound, silently dropping rows from later reads. (Whether each group's rows
-        // really carry its values is the caller's assertion — as in official
-        // DuckLake's add_data_files, that cannot be checked without reading data.)
+        // anything (inline or Parquet), so a bad one costs no uploads. A wrong
+        // arity or an unparseable value would otherwise be persisted and then
+        // used as an exact pruning bound, silently dropping rows from later
+        // reads. (Whether each group's rows really carry its values is the
+        // caller's assertion — as in official DuckLake's add_data_files, that
+        // cannot be checked without reading data.)
         if let Some(spec) =
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         {
@@ -1216,6 +1227,41 @@ impl DuckLakeTableWriter {
                 spec.validate_values(arrow_schema, values)?;
             }
         }
+
+        if self.should_inline(records_written, arrow_schema) {
+            let batches: Vec<RecordBatch> = groups
+                .iter()
+                .flat_map(|(_, batches)| batches.iter().cloned())
+                .collect();
+            let committed = self.metadata.register_inlined_data(
+                setup.table_id,
+                schema_name,
+                table_name,
+                setup.snapshot_id,
+                &batches,
+                mode,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.column_ids,
+                &options.commit_metadata,
+                options.expected_base_snapshot_id,
+            )?;
+            return Ok(WriteResult {
+                snapshot_id: committed.snapshot_id,
+                table_id: committed.table_id,
+                schema_id: committed.schema_id,
+                files_written: 0,
+                records_written: records_written as i64,
+            });
+        }
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
+
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
         let file_infos = self
             .write_partition_groups(
@@ -1341,6 +1387,30 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
+
+        let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        if self.should_inline(records_written, arrow_schema) {
+            let committed = self.metadata.register_inlined_data(
+                setup.table_id,
+                schema_name,
+                table_name,
+                setup.snapshot_id,
+                batches,
+                mode,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.column_ids,
+                &SnapshotCommitMetadata::new(),
+                None,
+            )?;
+            return Ok(WriteResult {
+                snapshot_id: committed.snapshot_id,
+                table_id: committed.table_id,
+                schema_id: committed.schema_id,
+                files_written: 0,
+                records_written: records_written as i64,
+            });
+        }
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
@@ -1440,6 +1510,14 @@ impl DuckLakeTableWriter {
             files_written: file_infos.len(),
             records_written,
         })
+    }
+
+    fn should_inline(&self, rows: usize, arrow_schema: &Schema) -> bool {
+        rows > 0
+            && self
+                .data_inlining_row_limit
+                .is_some_and(|limit| rows <= limit)
+            && self.metadata.supports_data_inlining(arrow_schema)
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -2623,6 +2701,7 @@ mod tests {
             options.compression,
             Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         );
+        assert_eq!(options.data_inlining_row_limit, Some(10));
         assert_eq!(options.max_row_group_rows, Some(122_880));
         assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
         assert_eq!(options.target_file_size, Some(5_000_000));
@@ -2648,6 +2727,7 @@ mod tests {
         let options = stored.with_overrides(&explicit);
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
+        assert_eq!(options.data_inlining_row_limit, Some(10));
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));
