@@ -5,12 +5,11 @@
 //! that DuckDB's own `ducklake` extension — and this crate's
 //! [`crate::DuckdbMetadataProvider`] — can read back what it writes.
 //!
-//! Scope is deliberately narrow (see `write-duckdb` feature): **legacy /
-//! single-catalog only** — INSERT / REPLACE / CREATE TABLE (including zero-row).
-//! No deletes, no upsert, no compaction, no partitioning, no multicatalog. The
-//! erroring trait defaults for [`MetadataWriter::promote_column_type`] and
-//! [`MetadataWriter::set_delete_file`] are inherited, and
-//! [`MetadataWriter::catalog_id`] returns `None`.
+//! Scope is the legacy, single-catalog layout selected by `write-duckdb`.
+//! Inserts, replacements, positional deletes, updates, compaction, truncate,
+//! append restoration, type promotion, and snapshot expiry share the SQLite
+//! writer's transaction and conflict semantics. Multicatalog remains specific
+//! to PostgreSQL, and [`MetadataWriter::catalog_id`] returns `None`.
 //!
 //! ## How this differs from the SQLite writer
 //!
@@ -38,12 +37,14 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
+use crate::maintenance::{ExpireCriteria, ExpiredSnapshot, format_sql_timestamp};
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, InlinedRowRef,
-    MetadataWriter, SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids,
+    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
+    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, InlinedRowRef, MetadataWriter,
+    SnapshotCommitMetadata, SourceRetirement, WriteMode, WriteSetupResult, assign_column_ids,
     catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
     catalog_columns_differ, quote_snapshot_name, quote_snapshot_table, table_write_changes,
-    top_level_column_ids, validate_name,
+    top_level_column_ids, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -167,6 +168,23 @@ fn duckdb_type_inlines(data_type: &DataType) -> bool {
     )
 }
 
+fn id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const RESOLVED_PATH: &str = "CASE
+    WHEN NOT df.path_is_relative THEN df.path
+    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
+    ELSE s.path || '/' || t.path || '/' || df.path
+END";
+
+const REL_FLAG: &str =
+    "(CASE WHEN df.path_is_relative AND t.path_is_relative AND s.path_is_relative
+           THEN true ELSE false END)";
+
 /// DuckLake catalog DDL for DuckDB.
 ///
 /// Column-for-column identical to `SQL_CREATE_SCHEMA` in the SQLite writer; the
@@ -277,8 +295,17 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     mapping_id BIGINT,
     begin_snapshot BIGINT NOT NULL,
     end_snapshot BIGINT,
+    partial_max BIGINT,
     -- References ducklake_partition_info.partition_id; NULL when unpartitioned.
     partition_id BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+    snapshot_id BIGINT PRIMARY KEY,
+    changes_made VARCHAR NOT NULL,
+    author VARCHAR,
+    commit_message VARCHAR,
+    commit_extra_info VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_table_stats (
@@ -339,7 +366,8 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     encryption_key VARCHAR,
     delete_count BIGINT,
     begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT
+    end_snapshot BIGINT,
+    partial_max BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
@@ -435,6 +463,177 @@ impl DuckdbMetadataWriter {
     fn connection(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("DuckDB connection mutex poisoned")
     }
+
+    /// Expire snapshots and remove catalog rows no longer reachable from a
+    /// surviving snapshot. Physical files are queued for later cleanup.
+    pub fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let most_recent: Option<i64> = tx.query_row(
+            "SELECT MAX(snapshot_id) FROM ducklake_snapshot",
+            [],
+            |row| row.get(0),
+        )?;
+        let Some(most_recent) = most_recent else {
+            tx.commit()?;
+            return Ok(Vec::new());
+        };
+        let candidates = match criteria {
+            ExpireCriteria::Versions(versions) => {
+                let versions = versions
+                    .into_iter()
+                    .filter(|snapshot| *snapshot != 0 && *snapshot != most_recent)
+                    .collect::<Vec<_>>();
+                if versions.is_empty() {
+                    tx.commit()?;
+                    return Ok(Vec::new());
+                }
+                let mut statement = tx.prepare(&format!(
+                    "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR)
+                     FROM ducklake_snapshot WHERE snapshot_id IN ({}) ORDER BY snapshot_id",
+                    id_list(&versions)
+                ))?;
+                statement
+                    .query_map([], |row| {
+                        Ok(ExpiredSnapshot {
+                            snapshot_id: row.get(0)?,
+                            snapshot_time: row.get(1)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            },
+            ExpireCriteria::OlderThan(cutoff) => {
+                let mut statement = tx.prepare(
+                    "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR)
+                     FROM ducklake_snapshot
+                     WHERE snapshot_id != 0 AND snapshot_id != ?
+                       AND snapshot_time < CAST(? AS TIMESTAMP)
+                     ORDER BY snapshot_id",
+                )?;
+                statement
+                    .query_map(params![most_recent, format_sql_timestamp(&cutoff)], |row| {
+                        Ok(ExpiredSnapshot {
+                            snapshot_id: row.get(0)?,
+                            snapshot_time: row.get(1)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            },
+        };
+        if candidates.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        let expire_ids = candidates
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .collect::<Vec<_>>();
+        tx.execute_batch(&format!(
+            "DELETE FROM ducklake_snapshot WHERE snapshot_id IN ({})",
+            id_list(&expire_ids)
+        ))?;
+
+        let dead_tables = {
+            let mut statement = tx.prepare(
+                "SELECT t.table_id FROM ducklake_table t
+                 WHERE t.end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= t.begin_snapshot AND snapshot_id < t.end_snapshot)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_table t2
+                     WHERE t2.table_id = t.table_id
+                       AND (t2.end_snapshot IS NULL OR EXISTS (
+                           SELECT 1 FROM ducklake_snapshot
+                           WHERE snapshot_id >= t2.begin_snapshot
+                             AND snapshot_id < t2.end_snapshot)))",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let dead_table_filter = if dead_tables.is_empty() {
+            "false".to_string()
+        } else {
+            format!("df.table_id IN ({})", id_list(&dead_tables))
+        };
+        let dead_data_files = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT df.data_file_id FROM ducklake_data_file df
+                 WHERE ({dead_table_filter}) OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
+            ))?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !dead_data_files.is_empty() {
+            let ids = id_list(&dead_data_files);
+            tx.execute_batch(&format!(
+                "INSERT INTO ducklake_files_scheduled_for_deletion
+                     (data_file_id, path, path_is_relative)
+                 SELECT df.data_file_id, {RESOLVED_PATH}, {REL_FLAG}
+                 FROM ducklake_data_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE df.data_file_id IN ({ids});
+                 DELETE FROM ducklake_data_file WHERE data_file_id IN ({ids})"
+            ))?;
+        }
+        let dead_data_filter = if dead_data_files.is_empty() {
+            "false".to_string()
+        } else {
+            format!("df.data_file_id IN ({})", id_list(&dead_data_files))
+        };
+        let dead_delete_table_filter = if dead_tables.is_empty() {
+            "false".to_string()
+        } else {
+            format!("df.table_id IN ({})", id_list(&dead_tables))
+        };
+        let dead_delete_files = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT df.delete_file_id FROM ducklake_delete_file df
+                 WHERE ({dead_data_filter}) OR ({dead_delete_table_filter})
+                    OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
+                        SELECT 1 FROM ducklake_snapshot
+                        WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
+            ))?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !dead_delete_files.is_empty() {
+            let ids = id_list(&dead_delete_files);
+            tx.execute_batch(&format!(
+                "INSERT INTO ducklake_files_scheduled_for_deletion
+                     (data_file_id, path, path_is_relative)
+                 SELECT df.delete_file_id, {RESOLVED_PATH}, {REL_FLAG}
+                 FROM ducklake_delete_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE df.delete_file_id IN ({ids});
+                 DELETE FROM ducklake_delete_file WHERE delete_file_id IN ({ids})"
+            ))?;
+        }
+        if !dead_tables.is_empty() {
+            let ids = id_list(&dead_tables);
+            tx.execute_batch(&format!(
+                "DELETE FROM ducklake_table WHERE table_id IN ({ids});
+                 DELETE FROM ducklake_table_stats WHERE table_id IN ({ids});
+                 DELETE FROM ducklake_column WHERE table_id IN ({ids});
+                 DELETE FROM ducklake_schema_versions WHERE table_id IN ({ids})"
+            ))?;
+        }
+        tx.execute_batch(
+            "DELETE FROM ducklake_schema
+             WHERE end_snapshot IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM ducklake_snapshot
+                 WHERE snapshot_id >= ducklake_schema.begin_snapshot
+                   AND snapshot_id < ducklake_schema.end_snapshot)",
+        )?;
+        tx.commit()?;
+        Ok(candidates)
+    }
 }
 
 /// Atomically reserve `n` consecutive ids from a monotonic counter row in
@@ -453,6 +652,21 @@ fn reserve_ids(tx: &Transaction<'_>, key: &str, n: i64) -> Result<i64> {
         |row| row.get(0),
     )?;
     Ok(last)
+}
+
+fn reserve_sequence_ids(tx: &Transaction<'_>, sequence: &str, n: i64) -> Result<Vec<i64>> {
+    let sql = format!("SELECT nextval('{sequence}')");
+    (0..n)
+        .map(|_| tx.query_row(&sql, [], |row| row.get(0)).map_err(Into::into))
+        .collect()
+}
+
+fn reserve_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
+    reserve_sequence_ids(tx, "ducklake_data_file_id_seq", n)
+}
+
+fn reserve_delete_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
+    reserve_sequence_ids(tx, "ducklake_delete_file_id_seq", n)
 }
 
 /// Insert the next `ducklake_snapshot` row in commit order, carrying
@@ -516,6 +730,7 @@ fn record_snapshot_changes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_table_write_changes(
     tx: &Transaction<'_>,
     snapshot_id: i64,
@@ -523,6 +738,7 @@ fn record_table_write_changes(
     schema_name: &str,
     table_name: &str,
     mode: WriteMode,
+    has_deletes: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = tx.query_row(
@@ -589,7 +805,7 @@ fn record_table_write_changes(
     changes.push(table_write_changes(
         table_id,
         mode,
-        false,
+        has_deletes,
         replaced_existing_data,
     ));
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata)
@@ -793,6 +1009,33 @@ fn insert_partition_metadata(
     Ok(())
 }
 
+fn live_columns_for_stats(
+    tx: &Transaction<'_>,
+    table_id: i64,
+) -> Result<(Vec<ColumnDef>, Vec<i64>)> {
+    let mut statement = tx.prepare(
+        "SELECT column_id, column_name, column_type
+         FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )?;
+    let rows = statement.query_map(params![table_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut columns = Vec::new();
+    let mut column_ids = Vec::new();
+    for row in rows {
+        let (column_id, name, ducklake_type) = row?;
+        column_ids.push(column_id);
+        columns.push(ColumnDef::new(name, ducklake_type, true)?);
+    }
+    Ok((columns, column_ids))
+}
+
 /// Recompute `ducklake_table_column_stats` from the table's live files and
 /// replace the stored rows. See the SQLite writer's equivalent for the rationale.
 fn recompute_table_column_stats(
@@ -860,6 +1103,136 @@ fn recompute_table_column_stats(
                 g.max_value,
             ],
         )?;
+    }
+    Ok(())
+}
+
+fn apply_delete_entry(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    base_snapshot: i64,
+    snapshot_id: i64,
+    entry: &DeleteFileEntry,
+) -> Result<()> {
+    let target_live: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM ducklake_data_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+            params![entry.data_file_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if target_live.is_none() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "UPDATE/DELETE on data file {} could not commit: the file is no longer live as of \
+             the catalog's current head (retired since snapshot {base_snapshot}); re-open the \
+             catalog at the latest snapshot and retry",
+            entry.data_file_id
+        )));
+    }
+    let current_delete: Option<i64> = tx
+        .query_row(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+            params![entry.data_file_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current_delete != entry.expected_prev_delete_file {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "UPDATE/DELETE on data file {} could not commit: its live delete file changed from \
+             {:?} to {current_delete:?} since snapshot {base_snapshot}; re-open the catalog at \
+             the latest snapshot and retry",
+            entry.data_file_id, entry.expected_prev_delete_file
+        )));
+    }
+    if let Some(delete_file_id) = entry.expected_prev_delete_file {
+        tx.execute(
+            "UPDATE ducklake_delete_file SET end_snapshot = ?
+             WHERE delete_file_id = ? AND end_snapshot IS NULL",
+            params![snapshot_id, delete_file_id],
+        )?;
+    }
+    let delete_file_id = reserve_delete_file_ids(tx, 1)?[0];
+    tx.execute(
+        "INSERT INTO ducklake_delete_file
+             (delete_file_id, data_file_id, table_id, path, path_is_relative,
+              file_size_bytes, footer_size, delete_count, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            delete_file_id,
+            entry.data_file_id,
+            table_id,
+            entry.delete.path.as_str(),
+            entry.delete.path_is_relative,
+            entry.delete.file_size_bytes,
+            entry.delete.footer_size,
+            entry.delete.delete_count,
+            snapshot_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// The physical `ducklake_inlined_data_*` tables registered for the table.
+/// Mirrors the SQLite writer's `inlined_table_names`.
+fn inlined_table_names(tx: &Transaction<'_>, table_id: i64) -> Result<Vec<String>> {
+    let mut statement =
+        tx.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
+    let names = statement
+        .query_map(params![table_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// Count the table's still-visible inlined rows across its registered physical
+/// tables. Mirrors the SQLite writer's `live_inlined_row_count`.
+fn live_inlined_row_count(tx: &Transaction<'_>, table_id: i64) -> Result<i64> {
+    let mut total = 0;
+    for table_name in inlined_table_names(tx, table_id)? {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE end_snapshot IS NULL",
+            quote_ident(&table_name)
+        );
+        total += tx.query_row(&sql, [], |row| row.get::<_, i64>(0))?;
+    }
+    Ok(total)
+}
+
+/// End the referenced inlined rows at `snapshot_id`, fencing each against
+/// `base_snapshot`. Mirrors the SQLite writer's `apply_inlined_deletes`
+/// (used by the combined `commit_deletes` path).
+fn apply_inlined_deletes(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    rows: &[InlinedRowRef],
+) -> Result<()> {
+    let registered = inlined_table_names(tx, table_id)?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    for row in rows {
+        if !registered.contains(&row.table_name) {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} belongs to an unregistered table '{}'",
+                row.row_id, row.table_name
+            )));
+        }
+        let affected = tx.execute(
+            &format!(
+                "UPDATE {} SET end_snapshot = ? \
+                 WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
+                quote_ident(&row.table_name)
+            ),
+            params![snapshot_id, row.row_id, base_snapshot],
+        )?;
+        if affected != 1 {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
+                row.row_id, row.table_name
+            )));
+        }
     }
     Ok(())
 }
@@ -1043,6 +1416,9 @@ fn finalize_snapshot(
 }
 
 impl MetadataWriter for DuckdbMetadataWriter {
+    fn supports_update(&self) -> bool {
+        true
+    }
     fn create_snapshot(&self) -> Result<i64> {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
@@ -1140,6 +1516,76 @@ impl MetadataWriter for DuckdbMetadataWriter {
         )?;
         tx.commit()?;
         Ok((table_id, true))
+    }
+
+    fn promote_column_type(
+        &self,
+        table_id: i64,
+        column_name: &str,
+        new_ducklake_type: &str,
+    ) -> Result<i64> {
+        crate::types::ducklake_to_arrow_type(new_ducklake_type)?;
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _carried) = insert_snapshot(&tx)?;
+        let row: Option<(i64, String, i64, Option<bool>)> = tx
+            .query_row(
+                "SELECT column_id, column_type, column_order, nulls_allowed
+                 FROM ducklake_column
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                params![table_id, column_name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let (column_id, current_type, column_order, nulls_allowed) = row.ok_or_else(|| {
+            crate::DuckLakeError::InvalidConfig(format!(
+                "promote_column_type: no live column '{column_name}' in table {table_id}"
+            ))
+        })?;
+        if crate::types::types_equal_canonical(&current_type, new_ducklake_type) {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "promote_column_type: column '{column_name}' is already type '{current_type}' (no change)"
+            )));
+        }
+        if !crate::types::is_promotable(&current_type, new_ducklake_type) {
+            return Err(crate::DuckLakeError::UnsupportedTypeChange {
+                operation: TypeChangeOperation::PromoteColumnType,
+                column: column_name.to_string(),
+                from: current_type,
+                to: new_ducklake_type.to_string(),
+            });
+        }
+
+        let schema_version = bump_schema_version(&tx, snapshot_id)?;
+        tx.execute(
+            "UPDATE ducklake_column SET end_snapshot = ?
+             WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+            params![snapshot_id, table_id, column_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_column
+                 (column_id, begin_snapshot, end_snapshot, table_id, column_order,
+                  column_name, column_type, nulls_allowed)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+            params![
+                column_id,
+                snapshot_id,
+                table_id,
+                column_order,
+                column_name,
+                new_ducklake_type,
+                nulls_allowed.unwrap_or(true)
+            ],
+        )?;
+        record_schema_version(&tx, snapshot_id, schema_version, table_id)?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("altered_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        tx.commit()?;
+        Ok(snapshot_id)
     }
 
     fn set_columns(
@@ -1332,6 +1778,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_name,
             table_name,
             mode,
+            false,
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -1467,6 +1914,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_name,
             table_name,
             mode,
+            false,
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -1614,6 +2062,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_name,
             table_name,
             mode,
+            false,
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -1706,6 +2155,594 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_id,
             table_id,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_delete_file(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        data_file_id: i64,
+        expected_prev_delete_file: Option<i64>,
+        base_snapshot: i64,
+        delete: &DeleteFileInfo,
+    ) -> Result<CommitIds> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        apply_delete_entry(
+            &tx,
+            table_id,
+            base_snapshot,
+            snapshot_id,
+            &DeleteFileEntry {
+                data_file_id,
+                expected_prev_delete_file,
+                delete: delete.clone(),
+            },
+        )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("deleted_from_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        let schema_id = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        validate_delete_entries(mode, deletes)?;
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let snapshot_id =
+            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let live_partition_id: Option<i64> = tx.query_row(
+            "SELECT (SELECT partition_id FROM ducklake_partition_info
+                     WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1)",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+        seed_stats_if_missing(&tx, table_id)?;
+        let row_id_start = tx.query_row(
+            "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+            params![table_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let data_file_id = reserve_file_ids(&tx, 1)?[0];
+        tx.execute(
+            "INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  footer_size, record_count, row_id_start, begin_snapshot)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                data_file_id,
+                table_id,
+                file.path.as_str(),
+                file.path_is_relative,
+                file.file_size_bytes,
+                file.footer_size,
+                file.record_count,
+                row_id_start,
+                snapshot_id,
+            ],
+        )?;
+        insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
+        insert_partition_metadata(&tx, table_id, data_file_id, file)?;
+        recompute_table_column_stats(&tx, table_id, columns, column_ids)?;
+        tx.execute(
+            "UPDATE ducklake_table_stats
+             SET next_row_id = next_row_id + ?, record_count = record_count + ?,
+                 file_size_bytes = file_size_bytes + ?
+             WHERE table_id = ?",
+            params![file.record_count, file.record_count, file.file_size_bytes, table_id],
+        )?;
+        for entry in deletes {
+            apply_delete_entry(&tx, table_id, base_snapshot, snapshot_id, entry)?;
+        }
+        record_table_write_changes(
+            &tx,
+            snapshot_id,
+            table_id,
+            schema_name,
+            table_name,
+            mode,
+            !deletes.is_empty(),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        let schema_id = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    fn commit_positional_deletes(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        base_snapshot: i64,
+        deletes: &[DeleteFileEntry],
+    ) -> Result<CommitIds> {
+        if deletes.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_positional_deletes requires at least one delete entry".to_string(),
+            ));
+        }
+        validate_delete_entries(WriteMode::Append, deletes)?;
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        for entry in deletes {
+            apply_delete_entry(&tx, table_id, base_snapshot, snapshot_id, entry)?;
+        }
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("deleted_from_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        let schema_id = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    fn commit_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        positional: &[DeleteFileEntry],
+        inlined: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        // Mixed positional + inlined DELETE in ONE snapshot/transaction,
+        // mirroring the SQLite writer's override (the trait default refuses the
+        // combination). Single-form deletes keep their dedicated paths.
+        if inlined.is_empty() {
+            return self.commit_positional_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                positional,
+            );
+        }
+        if positional.is_empty() {
+            return self.commit_inlined_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                inlined,
+            );
+        }
+        validate_delete_entries(WriteMode::Append, positional)?;
+        if inlined
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != inlined.len()
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_deletes contains duplicate inlined rows".to_string(),
+            ));
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        for entry in positional {
+            apply_delete_entry(&tx, table_id, base_snapshot, snapshot_id, entry)?;
+        }
+        apply_inlined_deletes(&tx, table_id, snapshot_id, base_snapshot, inlined)?;
+        let deleted = i64::try_from(inlined.len()).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig("commit_deletes row count exceeds i64".to_string())
+        })?;
+        tx.execute(
+            "UPDATE ducklake_table_stats
+             SET record_count = GREATEST(record_count - ?, 0) WHERE table_id = ?",
+            params![deleted, table_id],
+        )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("deleted_from_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        let schema_id: i64 = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    fn commit_compaction(
+        &self,
+        table_id: i64,
+        base_snapshot: i64,
+        sources: &[CompactionSourceFile],
+        outputs: &[CompactionOutputFile],
+        retirement: SourceRetirement,
+    ) -> Result<CommitIds> {
+        if sources.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_compaction requires at least one source file".to_string(),
+            ));
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        for source in sources {
+            let live: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM ducklake_data_file
+                     WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                    params![source.data_file_id, table_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if live.is_none() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "compaction of table {table_id} could not commit: source data file {} is no \
+                     longer live since snapshot {base_snapshot}; re-open the catalog and re-plan",
+                    source.data_file_id
+                )));
+            }
+            let current_delete: Option<i64> = tx
+                .query_row(
+                    "SELECT delete_file_id FROM ducklake_delete_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                    params![source.data_file_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_delete != source.delete_file_id {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "compaction of table {table_id} could not commit: the live delete file of \
+                     source data file {} changed from {:?} to {current_delete:?} since snapshot \
+                     {base_snapshot}; re-open the catalog and re-plan",
+                    source.data_file_id, source.delete_file_id
+                )));
+            }
+
+            // Inlined deletes mutate only ducklake_inlined_delete_<table_id>, so
+            // neither check above sees them; their rows are append-only, so a
+            // count compare-and-swap detects a concurrent inlined DELETE.
+            let inlined_delete_table =
+                crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let inlined_exists: bool = tx.query_row(
+                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+                params![inlined_delete_table.as_str()],
+                |row| row.get(0),
+            )?;
+            let current_inlined: i64 = if inlined_exists {
+                tx.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {} WHERE file_id = ?",
+                        quote_ident(&inlined_delete_table)
+                    ),
+                    params![source.data_file_id],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
+            if current_inlined != source.inlined_delete_count {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "compaction of table {table_id} could not commit: the inlined deletes of \
+                     source data file {} changed from {} to {current_inlined} rows since \
+                     snapshot {base_snapshot}; re-open the catalog and re-plan",
+                    source.data_file_id, source.inlined_delete_count
+                )));
+            }
+        }
+
+        let source_ids = sources
+            .iter()
+            .map(|source| source.data_file_id)
+            .collect::<Vec<_>>();
+        let source_ids = id_list(&source_ids);
+        match retirement {
+            SourceRetirement::Remove => {
+                tx.execute_batch(&format!(
+                    "INSERT INTO ducklake_files_scheduled_for_deletion
+                         (data_file_id, path, path_is_relative)
+                     SELECT df.data_file_id, {RESOLVED_PATH}, {REL_FLAG}
+                     FROM ducklake_data_file df
+                     JOIN ducklake_table t ON t.table_id = df.table_id
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE df.data_file_id IN ({source_ids});
+                     INSERT INTO ducklake_files_scheduled_for_deletion
+                         (data_file_id, path, path_is_relative)
+                     SELECT df.delete_file_id, {RESOLVED_PATH}, {REL_FLAG}
+                     FROM ducklake_delete_file df
+                     JOIN ducklake_table t ON t.table_id = df.table_id
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE df.data_file_id IN ({source_ids});
+                     DELETE FROM ducklake_delete_file WHERE data_file_id IN ({source_ids});
+                     DELETE FROM ducklake_data_file WHERE data_file_id IN ({source_ids});
+                     DELETE FROM ducklake_file_column_stats WHERE data_file_id IN ({source_ids});
+                     DELETE FROM ducklake_file_partition_value
+                     WHERE data_file_id IN ({source_ids})"
+                ))?;
+            },
+            SourceRetirement::Retire => {
+                tx.execute(
+                    &format!(
+                        "UPDATE ducklake_data_file SET end_snapshot = ?
+                         WHERE data_file_id IN ({source_ids}) AND end_snapshot IS NULL"
+                    ),
+                    params![snapshot_id],
+                )?;
+                tx.execute(
+                    &format!(
+                        "UPDATE ducklake_delete_file SET end_snapshot = ?
+                         WHERE data_file_id IN ({source_ids}) AND end_snapshot IS NULL"
+                    ),
+                    params![snapshot_id],
+                )?;
+            },
+        }
+
+        let output_count = i64::try_from(outputs.len()).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig(
+                "commit_compaction output count exceeds i64".to_string(),
+            )
+        })?;
+        let output_ids = reserve_file_ids(&tx, output_count)?;
+        for (output, data_file_id) in outputs.iter().zip(output_ids) {
+            let begin_snapshot = output.begin_snapshot.unwrap_or(snapshot_id);
+            tx.execute(
+                "INSERT INTO ducklake_data_file
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot, partial_max)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                params![
+                    data_file_id,
+                    table_id,
+                    output.file.path.as_str(),
+                    output.file.path_is_relative,
+                    output.file.file_size_bytes,
+                    output.file.footer_size,
+                    output.file.record_count,
+                    begin_snapshot,
+                    output.partial_max,
+                ],
+            )?;
+            insert_file_column_stats(&tx, table_id, data_file_id, &output.file.column_stats)?;
+            insert_partition_metadata(&tx, table_id, data_file_id, &output.file)?;
+        }
+        seed_stats_if_missing(&tx, table_id)?;
+        tx.execute(
+            "UPDATE ducklake_table_stats SET
+                 record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                 FROM ducklake_data_file
+                                 WHERE table_id = ? AND end_snapshot IS NULL),
+                 file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                    FROM ducklake_data_file
+                                    WHERE table_id = ? AND end_snapshot IS NULL)
+             WHERE table_id = ?",
+            params![table_id, table_id, table_id],
+        )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("compacted_table:{table_id}"),
+            &SnapshotCommitMetadata::new().with_message("datafusion compaction"),
+        )?;
+        let schema_id = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    fn retire_appends_since(&self, table_id: i64, base_snapshot: i64) -> Result<Option<i64>> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        let impure_delete: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_delete_file
+                 WHERE table_id = ? AND begin_snapshot > ? LIMIT 1",
+                params![table_id, base_snapshot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let impure_ended: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND begin_snapshot <= ?
+                   AND end_snapshot IS NOT NULL AND end_snapshot > ? LIMIT 1",
+                params![table_id, base_snapshot, base_snapshot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let impure_column: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_column
+                 WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?) LIMIT 1",
+                params![table_id, base_snapshot, base_snapshot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let impure_partition: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_partition_info
+                 WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?) LIMIT 1",
+                params![table_id, base_snapshot, base_snapshot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if impure_delete.is_some()
+            || impure_ended.is_some()
+            || impure_column.is_some()
+            || impure_partition.is_some()
+        {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "table {table_id}: changes since snapshot {base_snapshot} are not a pure append \
+                 (delete/replace/update or schema/partition change present); refusing to retire"
+            )));
+        }
+        let has_appended: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ? LIMIT 1",
+                params![table_id, base_snapshot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if has_appended.is_none() {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE ducklake_data_file SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ?",
+            params![snapshot_id, table_id, base_snapshot],
+        )?;
+        tx.execute(
+            "UPDATE ducklake_table_stats SET
+                 record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                 FROM ducklake_data_file
+                                 WHERE table_id = ? AND end_snapshot IS NULL),
+                 file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                    FROM ducklake_data_file
+                                    WHERE table_id = ? AND end_snapshot IS NULL)
+             WHERE table_id = ?",
+            params![table_id, table_id, table_id],
+        )?;
+        let (columns, column_ids) = live_columns_for_stats(&tx, table_id)?;
+        recompute_table_column_stats(&tx, table_id, &columns, &column_ids)?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("deleted_from_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        tx.commit()?;
+        Ok(Some(snapshot_id))
+    }
+
+    fn commit_truncate(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+    ) -> Result<u64> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
+        let has_live_data: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let live_inlined = live_inlined_row_count(&tx, table_id)?;
+        if has_live_data.is_none() && live_inlined == 0 {
+            return Ok(0);
+        }
+        let gross: Option<i64> = tx
+            .query_row(
+                "SELECT record_count FROM ducklake_table_stats WHERE table_id = ?",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let deleted = tx.query_row(
+            "SELECT COALESCE(SUM(delete_count), 0) FROM ducklake_delete_file
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![table_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let live_rows = u64::try_from((gross.unwrap_or(0) - deleted).max(0)).unwrap_or(0);
+        tx.execute(
+            "UPDATE ducklake_data_file SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![snapshot_id, table_id],
+        )?;
+        for table_name in inlined_table_names(&tx, table_id)? {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
+                    quote_ident(&table_name)
+                ),
+                params![snapshot_id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE ducklake_delete_file SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![snapshot_id, table_id],
+        )?;
+        tx.execute(
+            "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0
+             WHERE table_id = ?",
+            params![table_id],
+        )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("deleted_from_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
+        tx.commit()?;
+        Ok(live_rows)
     }
 
     fn set_partition_spec(
@@ -2008,6 +3045,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_name,
             table_name,
             mode,
+            false,
             &SnapshotCommitMetadata::default(),
         )?;
         let schema_id: i64 = tx.query_row(
@@ -2093,7 +3131,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
             "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
         )?;
         conn.execute_batch(
-            "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
+            "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL;
+             ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT;
+             ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
         )?;
         // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, and
         // schema/table/data_file/delete_file ids use sequences, so none of those
@@ -2377,6 +3417,110 @@ mod tests {
         );
     }
 
+    fn test_writer(temp: &TempDir) -> DuckdbMetadataWriter {
+        let writer = DuckdbMetadataWriter::new_with_init(
+            temp.path().join("catalog.ducklake").to_str().unwrap(),
+        )
+        .unwrap();
+        writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+        writer
+    }
+
+    fn int_column() -> Vec<ColumnDef> {
+        vec![ColumnDef::new("id", "int32", false).unwrap()]
+    }
+
+    fn append(
+        writer: &DuckdbMetadataWriter,
+        path: &str,
+        rows: i64,
+    ) -> (WriteSetupResult, CommitIds) {
+        let columns = int_column();
+        let setup = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+            .unwrap();
+        let commit = writer
+            .register_data_file(
+                setup.table_id,
+                "main",
+                "t",
+                setup.snapshot_id,
+                &DataFileInfo::new(path, rows * 10, rows),
+                WriteMode::Append,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.column_ids,
+            )
+            .unwrap();
+        (setup, commit)
+    }
+
+    fn file_id(writer: &DuckdbMetadataWriter, path: &str) -> i64 {
+        writer
+            .connection()
+            .query_row(
+                "SELECT data_file_id FROM ducklake_data_file WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn append_inlined(
+        writer: &DuckdbMetadataWriter,
+        values: &[i32],
+    ) -> (WriteSetupResult, CommitIds) {
+        let columns = int_column();
+        let setup = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+            .unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .unwrap();
+        let commit = writer
+            .register_inlined_data(
+                setup.table_id,
+                "main",
+                "t",
+                setup.snapshot_id,
+                &[batch],
+                WriteMode::Append,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.column_ids,
+                &SnapshotCommitMetadata::default(),
+                None,
+            )
+            .unwrap();
+        (setup, commit)
+    }
+
+    fn inlined_table(writer: &DuckdbMetadataWriter, table_id: i64) -> String {
+        writer
+            .connection()
+            .query_row(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn changes_made(writer: &DuckdbMetadataWriter, snapshot_id: i64) -> Option<String> {
+        writer
+            .connection()
+            .query_row(
+                "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     /// End-to-end round trip: write a small table through the real write path
     /// (begin_write_transaction + register_data_file), then read every catalog
     /// facet back through the DuckdbMetadataProvider and assert the snapshot,
@@ -2548,5 +3692,476 @@ mod tests {
         assert_eq!(records, 10, "record_count = 3 + 7");
         assert_eq!(next, 10, "next_row_id advances by sum of record_counts");
         assert_eq!(bytes, 350, "file_size_bytes accumulates");
+    }
+
+    #[test]
+    fn duckdb_delete_update_and_truncate_share_sqlite_semantics() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (first_setup, first_commit) = append(&writer, "source.parquet", 4);
+        let source_id = file_id(&writer, "source.parquet");
+        let first_delete = writer
+            .set_delete_file(
+                first_setup.table_id,
+                "main",
+                "t",
+                first_commit.snapshot_id + 1,
+                source_id,
+                None,
+                first_commit.snapshot_id,
+                &DeleteFileInfo::new("delete-1.parquet", 10, 1),
+            )
+            .unwrap();
+        let first_delete_id: i64 = writer
+            .connection()
+            .query_row(
+                "SELECT delete_file_id FROM ducklake_delete_file
+                 WHERE data_file_id = ? AND end_snapshot IS NULL",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let columns = int_column();
+        let update = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+            .unwrap();
+        let update_commit = writer
+            .register_data_file_with_deletes(
+                update.table_id,
+                "main",
+                "t",
+                update.snapshot_id,
+                &DataFileInfo::new("updated.parquet", 10, 1),
+                &[DeleteFileEntry {
+                    data_file_id: source_id,
+                    expected_prev_delete_file: Some(first_delete_id),
+                    delete: DeleteFileInfo::new("delete-2.parquet", 20, 2),
+                }],
+                WriteMode::Append,
+                update.base_snapshot_id,
+                &columns,
+                &update.column_ids,
+            )
+            .unwrap();
+        assert!(writer.supports_update());
+        assert_eq!(update_commit.snapshot_id, first_delete.snapshot_id + 1);
+        let (new_file_snapshot, old_delete_end, new_delete_snapshot): (i64, Option<i64>, i64) =
+            writer
+                .connection()
+                .query_row(
+                    "SELECT
+                    (SELECT begin_snapshot FROM ducklake_data_file WHERE path = 'updated.parquet'),
+                    (SELECT end_snapshot FROM ducklake_delete_file WHERE delete_file_id = ?),
+                    (SELECT begin_snapshot FROM ducklake_delete_file
+                     WHERE path = 'delete-2.parquet')",
+                    params![first_delete_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(new_file_snapshot, update_commit.snapshot_id);
+        assert_eq!(old_delete_end, Some(update_commit.snapshot_id));
+        assert_eq!(new_delete_snapshot, update_commit.snapshot_id);
+        assert_eq!(
+            changes_made(&writer, first_delete.snapshot_id),
+            Some(format!("deleted_from_table:{}", first_setup.table_id))
+        );
+        assert_eq!(
+            changes_made(&writer, update_commit.snapshot_id),
+            Some(format!(
+                "deleted_from_table:{0},inserted_into_table:{0}",
+                first_setup.table_id
+            ))
+        );
+
+        let removed = writer
+            .commit_truncate(first_setup.table_id, "main", "t", update_commit.snapshot_id)
+            .unwrap();
+        assert_eq!(removed, 3);
+        let state: (i64, i64, i64) = writer
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL),
+                    (SELECT COUNT(*) FROM ducklake_delete_file WHERE end_snapshot IS NULL),
+                    (SELECT record_count FROM ducklake_table_stats WHERE table_id = ?)",
+                params![first_setup.table_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (0, 0, 0));
+    }
+
+    #[test]
+    fn duckdb_compaction_removes_sources_and_records_output() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, first) = append(&writer, "a.parquet", 2);
+        let (_, second) = append(&writer, "b.parquet", 3);
+        let sources = [
+            CompactionSourceFile {
+                data_file_id: file_id(&writer, "a.parquet"),
+                delete_file_id: None,
+                inlined_delete_count: 0,
+            },
+            CompactionSourceFile {
+                data_file_id: file_id(&writer, "b.parquet"),
+                delete_file_id: None,
+                inlined_delete_count: 0,
+            },
+        ];
+        let output = CompactionOutputFile {
+            file: DataFileInfo::new("merged.parquet", 45, 5),
+            begin_snapshot: Some(first.snapshot_id),
+            partial_max: Some(second.snapshot_id),
+        };
+        let commit = writer
+            .commit_compaction(
+                setup.table_id,
+                second.snapshot_id,
+                &sources,
+                &[output],
+                SourceRetirement::Remove,
+            )
+            .unwrap();
+        let state: (i64, i64, Option<i64>, Option<i64>, i64, String) = writer
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM ducklake_data_file),
+                    (SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion),
+                    (SELECT row_id_start FROM ducklake_data_file WHERE path = 'merged.parquet'),
+                    (SELECT partial_max FROM ducklake_data_file WHERE path = 'merged.parquet'),
+                    (SELECT record_count FROM ducklake_table_stats WHERE table_id = ?),
+                    (SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?)",
+                params![setup.table_id, commit.snapshot_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                1,
+                2,
+                None,
+                Some(second.snapshot_id),
+                5,
+                format!("compacted_table:{}", setup.table_id),
+            )
+        );
+    }
+
+    #[test]
+    fn duckdb_restore_retires_only_the_append_delta() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, base) = append(&writer, "base.parquet", 2);
+        append(&writer, "appended.parquet", 3);
+        let restore = writer
+            .retire_appends_since(setup.table_id, base.snapshot_id)
+            .unwrap()
+            .unwrap();
+        let state: (Option<i64>, Option<i64>, i64, i64) = writer
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT end_snapshot FROM ducklake_data_file WHERE path = 'base.parquet'),
+                    (SELECT end_snapshot FROM ducklake_data_file WHERE path = 'appended.parquet'),
+                    (SELECT record_count FROM ducklake_table_stats WHERE table_id = ?),
+                    (SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?)",
+                params![setup.table_id, setup.table_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (None, Some(restore), 2, 5));
+        assert_eq!(
+            writer
+                .retire_appends_since(setup.table_id, base.snapshot_id)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn duckdb_promotes_column_with_stable_identity() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, _) = append(&writer, "a.parquet", 1);
+        let old_column_id: i64 = writer
+            .connection()
+            .query_row(
+                "SELECT column_id FROM ducklake_column WHERE end_snapshot IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot = writer
+            .promote_column_type(setup.table_id, "id", "int64")
+            .unwrap();
+        let versions: Vec<(i64, String, i64, Option<i64>)> = {
+            let conn = writer.connection();
+            let mut statement = conn
+                .prepare(
+                    "SELECT column_id, column_type, begin_snapshot, end_snapshot
+                     FROM ducklake_column ORDER BY begin_snapshot",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            versions,
+            vec![
+                (old_column_id, "int32".to_string(), 1, Some(snapshot)),
+                (old_column_id, "int64".to_string(), snapshot, None),
+            ]
+        );
+        assert!(
+            writer
+                .promote_column_type(setup.table_id, "id", "int16")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn duckdb_expiry_keeps_head_and_schedules_unreachable_files() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, first) = append(&writer, "a.parquet", 2);
+        writer
+            .commit_truncate(setup.table_id, "main", "t", first.snapshot_id)
+            .unwrap();
+        let head: i64 = writer
+            .connection()
+            .query_row(
+                "SELECT MAX(snapshot_id) FROM ducklake_snapshot",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expired = writer
+            .expire_snapshots(ExpireCriteria::Versions(vec![first.snapshot_id, head]))
+            .unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].snapshot_id, first.snapshot_id);
+        let state: (i64, i64, i64) = writer
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM ducklake_snapshot),
+                    (SELECT COUNT(*) FROM ducklake_data_file),
+                    (SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (1, 0, 1));
+    }
+
+    #[test]
+    fn duckdb_truncate_ends_inline_only_table() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, commit) = append_inlined(&writer, &[1, 2]);
+        let removed = writer
+            .commit_truncate(setup.table_id, "main", "t", commit.snapshot_id)
+            .unwrap();
+        assert_eq!(removed, 2, "the two inline rows are the whole live table");
+        let truncate_snapshot = commit.snapshot_id + 1;
+        let physical = inlined_table(&writer, setup.table_id);
+        let (head, live, ended, record_count): (i64, i64, i64, i64) = writer
+            .connection()
+            .query_row(
+                &format!(
+                    "SELECT
+                        (SELECT MAX(snapshot_id) FROM ducklake_snapshot),
+                        (SELECT COUNT(*) FROM {physical} WHERE end_snapshot IS NULL),
+                        (SELECT COUNT(*) FROM {physical} WHERE end_snapshot = {truncate_snapshot}),
+                        (SELECT record_count FROM ducklake_table_stats WHERE table_id = {})",
+                    setup.table_id
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (head, live, ended, record_count),
+            (truncate_snapshot, 0, 2, 0)
+        );
+        assert_eq!(
+            changes_made(&writer, truncate_snapshot),
+            Some(format!("deleted_from_table:{}", setup.table_id))
+        );
+        // Nothing left to truncate: idempotent no-op with no new snapshot.
+        assert_eq!(
+            writer
+                .commit_truncate(setup.table_id, "main", "t", truncate_snapshot)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn duckdb_truncate_retires_files_and_ends_inline_rows() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, _) = append(&writer, "base.parquet", 3);
+        let (_, inline_commit) = append_inlined(&writer, &[10, 11]);
+        let removed = writer
+            .commit_truncate(setup.table_id, "main", "t", inline_commit.snapshot_id)
+            .unwrap();
+        assert_eq!(removed, 5, "3 parquet rows + 2 inline rows");
+        let truncate_snapshot = inline_commit.snapshot_id + 1;
+        let physical = inlined_table(&writer, setup.table_id);
+        let (file_end, live_inline, ended_inline, record_count): (Option<i64>, i64, i64, i64) =
+            writer
+                .connection()
+                .query_row(
+                    &format!(
+                        "SELECT
+                            (SELECT end_snapshot FROM ducklake_data_file
+                             WHERE path = 'base.parquet'),
+                            (SELECT COUNT(*) FROM {physical} WHERE end_snapshot IS NULL),
+                            (SELECT COUNT(*) FROM {physical}
+                             WHERE end_snapshot = {truncate_snapshot}),
+                            (SELECT record_count FROM ducklake_table_stats WHERE table_id = {})",
+                        setup.table_id
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            (file_end, live_inline, ended_inline, record_count),
+            (Some(truncate_snapshot), 0, 2, 0)
+        );
+        assert_eq!(
+            changes_made(&writer, truncate_snapshot),
+            Some(format!("deleted_from_table:{}", setup.table_id))
+        );
+    }
+
+    #[test]
+    fn duckdb_commit_deletes_mixes_positional_and_inlined_in_one_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, _) = append(&writer, "base.parquet", 3);
+        let (_, inline_commit) = append_inlined(&writer, &[10, 11]);
+        let source_id = file_id(&writer, "base.parquet");
+        let physical = inlined_table(&writer, setup.table_id);
+        // Inline rows follow the parquet file's 3 rows: row_ids 3 and 4.
+        let commit = writer
+            .commit_deletes(
+                setup.table_id,
+                "main",
+                "t",
+                inline_commit.snapshot_id,
+                &[DeleteFileEntry {
+                    data_file_id: source_id,
+                    expected_prev_delete_file: None,
+                    delete: DeleteFileInfo::new("delete-1.parquet", 10, 1),
+                }],
+                &[InlinedRowRef {
+                    table_name: physical.clone(),
+                    row_id: 3,
+                }],
+            )
+            .unwrap();
+        assert_eq!(commit.snapshot_id, inline_commit.snapshot_id + 1);
+        let (delete_begin, deleted_inline_end, other_inline_end, record_count): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        ) = writer
+            .connection()
+            .query_row(
+                &format!(
+                    "SELECT
+                        (SELECT begin_snapshot FROM ducklake_delete_file
+                         WHERE path = 'delete-1.parquet'),
+                        (SELECT end_snapshot FROM {physical} WHERE row_id = 3),
+                        (SELECT end_snapshot FROM {physical} WHERE row_id = 4),
+                        (SELECT record_count FROM ducklake_table_stats WHERE table_id = {})",
+                    setup.table_id
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(delete_begin, commit.snapshot_id);
+        assert_eq!(deleted_inline_end, Some(commit.snapshot_id));
+        assert_eq!(other_inline_end, None);
+        assert_eq!(
+            record_count, 4,
+            "only the inline delete adjusts the gross count"
+        );
+        assert_eq!(
+            changes_made(&writer, commit.snapshot_id),
+            Some(format!("deleted_from_table:{}", setup.table_id))
+        );
+    }
+
+    #[test]
+    fn duckdb_positional_delete_snapshot_records_changes_made() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let (setup, base) = append(&writer, "a.parquet", 2);
+        let commit = writer
+            .commit_positional_deletes(
+                setup.table_id,
+                "main",
+                "t",
+                base.snapshot_id,
+                &[DeleteFileEntry {
+                    data_file_id: file_id(&writer, "a.parquet"),
+                    expected_prev_delete_file: None,
+                    delete: DeleteFileInfo::new("d.parquet", 10, 1),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            changes_made(&writer, commit.snapshot_id),
+            Some(format!("deleted_from_table:{}", setup.table_id))
+        );
+    }
+
+    #[test]
+    fn duckdb_first_write_commits_after_abandoned_staging() {
+        let temp = TempDir::new().unwrap();
+        let writer = test_writer(&temp);
+        let columns = int_column();
+        // Stage the table but never write: it persists with zero live columns.
+        let staged = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+            .unwrap();
+        // The next write's commit creates the columns rather than conflicting.
+        let (setup, commit) = append(&writer, "a.parquet", 2);
+        assert_eq!(setup.table_id, staged.table_id);
+        assert_eq!(commit.snapshot_id, 1, "abandoned staging left no snapshot");
+        let live_columns: i64 = writer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+                params![setup.table_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_columns, 1);
     }
 }
