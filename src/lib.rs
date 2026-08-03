@@ -136,16 +136,17 @@ pub use delete_exec::DuckLakeDeleteExec;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, MetadataWriter, SnapshotCommitMetadata, SourceRetirement,
-    WriteMode, WriteResult, WriteSetupResult,
+    BatchCommit, BatchEntry, BatchOp, BatchTableCommit, ColumnDef, ColumnStat, CommitIds,
+    CompactionOutputFile, CompactionSourceFile, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
+    MetadataWriter, SnapshotCommitMetadata, SourceRetirement, WriteMode, WriteResult,
+    WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;
 #[cfg(feature = "write-mysql")]
 pub use metadata_writer_mysql::MySqlMetadataWriter;
 #[cfg(feature = "write-postgres")]
-pub use metadata_writer_postgres::PostgresMetadataWriter;
+pub use metadata_writer_postgres::{PostgresMetadataWriter, commit_batch_in_tx};
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres_single::PostgresSingleCatalogMetadataWriter;
 #[cfg(feature = "write-sqlite")]
