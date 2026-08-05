@@ -9,6 +9,8 @@
 //! - Per-catalog dense `schema_version` allocation
 //! - No orphan mapping rows after writes
 
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::metadata_writer::{
     ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,

@@ -9,6 +9,7 @@
 //! as `tests/it/mysql_metadata_provider_test.rs`: it is ignored under
 //! `skip-tests-with-docker` on macOS (Docker unavailable there).
 
+use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::{
     ColumnDef, DataFileInfo, MetadataProvider, MetadataWriter, MySqlMetadataProvider,
     MySqlMetadataWriter, SnapshotCommitMetadata, WriteMode,
