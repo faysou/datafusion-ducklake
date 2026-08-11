@@ -223,8 +223,22 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_catalog (
         catalog_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         catalog_name VARCHAR NOT NULL UNIQUE,
+        data_path VARCHAR,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )"#,
+    r#"ALTER TABLE ducklake_catalog
+        ADD COLUMN IF NOT EXISTS data_path VARCHAR"#,
+    r#"UPDATE ducklake_catalog AS catalog
+        SET data_path = (
+            SELECT value FROM ducklake_metadata
+            WHERE key = 'data_path' AND scope IS NULL
+            LIMIT 1
+        )
+        WHERE catalog.data_path IS NULL
+          AND EXISTS (
+              SELECT 1 FROM ducklake_metadata
+              WHERE key = 'data_path' AND scope IS NULL
+          )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_catalog_snapshot_map (
         catalog_id BIGINT NOT NULL,
         snapshot_id BIGINT NOT NULL,
@@ -261,6 +275,10 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
         ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_dropped_data_path (
+        data_path VARCHAR PRIMARY KEY,
+        dropped_at TIMESTAMPTZ DEFAULT NOW()
+    )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_catalog_snapshot_map_snapshot
         ON ducklake_catalog_snapshot_map(snapshot_id)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_catalog_schema_map_schema
@@ -3977,35 +3995,38 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     fn get_data_path(&self) -> Result<String> {
         block_on(async {
-            let row =
-                sqlx::query("SELECT value FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
-                    .bind("data_path")
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let path: Option<String> = sqlx::query_scalar(
+                "SELECT COALESCE(
+                     (SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1),
+                     (SELECT value FROM ducklake_metadata
+                      WHERE key = 'data_path' AND scope IS NULL LIMIT 1)
+                 )",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&self.pool)
+            .await?;
 
-            match row {
-                Some(r) => Ok(r.try_get(0)?),
-                None => Err(crate::error::DuckLakeError::InvalidConfig(
+            path.ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(
                     "Missing required catalog metadata: 'data_path' not configured.".to_string(),
-                )),
-            }
+                )
+            })
         })
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
-        // data_path is global per Phase 1. Reject silent overwrites — if it's
-        // already set to a different value, a concurrent tenant likely set it.
         block_on(async {
             let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
 
-            let existing: Option<String> = sqlx::query(
-                "SELECT value FROM ducklake_metadata
-                 WHERE key = 'data_path' AND scope IS NULL FOR UPDATE",
-            )
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.try_get(0))
-            .transpose()?;
+            let existing: Option<String> =
+                sqlx::query("SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1")
+                    .bind(self.catalog_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.try_get(0))
+                    .transpose()?
+                    .flatten();
 
             match existing {
                 Some(cur) if cur == path => {
@@ -4014,16 +4035,31 @@ impl MetadataWriter for PostgresMetadataWriter {
                 },
                 Some(cur) => {
                     return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                        "data_path already set to {:?}, refusing to overwrite with {:?}",
-                        cur, path
+                        "data_path for catalog_id {} already set to {:?}, refusing to overwrite with {:?}",
+                        self.catalog_id, cur, path
                     )));
                 },
                 None => {},
             }
 
+            sqlx::query("UPDATE ducklake_catalog SET data_path = $1 WHERE catalog_id = $2")
+                .bind(path)
+                .bind(self.catalog_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Keep the first path as the legacy shared-root fallback for catalogs created
+            // before data_path became catalog-scoped.
+            sqlx::query("LOCK TABLE ducklake_metadata IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(
                 "INSERT INTO ducklake_metadata (key, value, scope)
-                 VALUES ('data_path', $1, NULL)",
+                 SELECT 'data_path', $1, NULL
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_metadata
+                     WHERE key = 'data_path' AND scope IS NULL
+                 )",
             )
             .bind(path)
             .execute(&mut *tx)
