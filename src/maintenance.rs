@@ -11,10 +11,10 @@
 //! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`], [`cleanup_old_files_in_catalog`])
 //!    reads the scheduled rows, deletes the objects from the object store, and removes the rows.
 //! 3. **delete_orphaned_files** ([`delete_orphaned_files_sqlite`],
-//!    [`delete_orphaned_files_multicatalog`]) lists the data path, subtracts everything
-//!    referenced by the catalog (data files + delete files + still-scheduled-for-deletion),
-//!    and deletes whatever's left. Catches files left by aborted writes and by
-//!    `drop_catalog` (which hard-deletes catalog metadata without scheduling its files).
+//!    [`delete_orphaned_files_in_catalog`], [`delete_orphaned_files_multicatalog`]) lists a data
+//!    path, subtracts referenced data files, delete files, and files still scheduled for deletion,
+//!    and deletes whatever is left. The catalog-scoped form catches files left by aborted writes.
+//!    The global form also reclaims dropped-catalog files from retained data-path tombstones.
 //!
 //! The metadata writers deliberately hold no object store — physical I/O lives here so the
 //! catalog layer stays storage-agnostic (the object store comes from the caller, e.g. the
@@ -163,7 +163,7 @@ pub async fn cleanup_old_files_in_catalog(
     criteria: CleanupCriteria,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let data_path = mgr.get_data_path().await?;
+    let data_path = mgr.get_data_path_in_catalog(catalog_name).await?;
     let files = mgr
         .list_scheduled_for_deletion_in_catalog(catalog_name, &criteria)
         .await?;
@@ -265,18 +265,11 @@ pub async fn delete_orphaned_files_sqlite(
     run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
 }
 
-/// List the multicatalog's shared `data_path` and delete every `.parquet` not
-/// referenced by any catalog in the metadata DB.
+/// Sweep every registered multicatalog data path and delete unreferenced Parquet files.
 ///
-/// **Global, not per-catalog.** In our multicatalog Postgres model every catalog
-/// shares one `data_path`, so the natural unit for orphan reclamation is the
-/// whole data path. The referenced set is built across every catalog's data
-/// files, delete files, and still-pending scheduled-for-deletion rows. This
-/// closes the file-leak left by [`MulticatalogManager::drop_catalog`] — which
-/// hard-deletes catalog metadata in one shot, so its files become unreferenced
-/// rather than scheduled.
-///
-/// [`MulticatalogManager::drop_catalog`]: crate::multicatalog::MulticatalogManager::drop_catalog
+/// All roots must resolve to the same object-store authority because this API
+/// accepts one object store. Use [`delete_orphaned_files_in_data_path`] with the
+/// matching store when one metadata database spans multiple authorities.
 #[cfg(feature = "write-postgres")]
 pub async fn delete_orphaned_files_multicatalog(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -284,7 +277,89 @@ pub async fn delete_orphaned_files_multicatalog(
     criteria: CleanupCriteria,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let data_path = mgr.get_data_path().await?;
-    let referenced = mgr.list_referenced_paths().await?;
-    run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
+    let data_paths = mgr.list_data_paths().await?;
+    let mut authority = None;
+    for data_path in &data_paths {
+        let (current, _) = parse_object_store_url(data_path)?;
+        if authority
+            .as_ref()
+            .is_some_and(|expected| expected != &current)
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "Multicatalog data paths span multiple object-store authorities; clean each path with delete_orphaned_files_in_data_path"
+                    .to_string(),
+            ));
+        }
+        authority = Some(current);
+    }
+
+    let mut deleted = Vec::new();
+    for data_path in data_paths {
+        deleted.extend(
+            delete_orphaned_files_in_data_path_inner(
+                mgr,
+                &data_path,
+                Arc::clone(&object_store),
+                criteria.clone(),
+                dry_run,
+            )
+            .await?,
+        );
+    }
+    deleted.sort();
+    deleted.dedup();
+    Ok(deleted)
+}
+
+/// Delete orphaned Parquet files within one catalog's data path.
+#[cfg(feature = "write-postgres")]
+pub async fn delete_orphaned_files_in_catalog(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    catalog_name: &str,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = mgr.get_data_path_in_catalog(catalog_name).await?;
+    delete_orphaned_files_in_data_path_inner(mgr, &data_path, object_store, criteria, dry_run).await
+}
+
+/// Delete orphaned Parquet files within one retained multicatalog data path.
+#[cfg(feature = "write-postgres")]
+pub async fn delete_orphaned_files_in_data_path(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    data_path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    if !mgr
+        .list_data_paths()
+        .await?
+        .iter()
+        .any(|path| path == data_path)
+    {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "Data path {data_path:?} is not registered for multicatalog cleanup"
+        )));
+    }
+    delete_orphaned_files_in_data_path_inner(mgr, data_path, object_store, criteria, dry_run).await
+}
+
+#[cfg(feature = "write-postgres")]
+async fn delete_orphaned_files_in_data_path_inner(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    data_path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let clear_tombstone = !dry_run && matches!(&criteria, CleanupCriteria::All);
+    let referenced = mgr.list_referenced_paths_in_data_path(data_path).await?;
+    let deleted =
+        run_orphan_cleanup(data_path, referenced, object_store, criteria, dry_run).await?;
+    if clear_tombstone {
+        mgr.clear_dropped_data_path(data_path).await?;
+    }
+    Ok(deleted)
 }
