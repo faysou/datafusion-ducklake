@@ -14,10 +14,11 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, SnapshotCommitMetadata, WriteMode,
-    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, table_write_changes,
-    top_level_column_ids, validate_delete_entries, validate_name,
+    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, table_write_changes, top_level_column_ids, validate_delete_entries,
+    validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -1153,12 +1154,6 @@ async fn recompute_table_column_stats(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    name = "ducklake.finalize_snapshot",
-    level = "info",
-    skip_all,
-    fields(catalog_id, schema_name, table_name)
-)]
 async fn finalize_snapshot(
     catalog_id: i64,
     schema_name: &str,
@@ -1170,6 +1165,54 @@ async fn finalize_snapshot(
     base_snapshot: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(i64, i64, i64)> {
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+         VALUES (NOW(), 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    let mut schema_version = 0;
+    let mut schema_changed = false;
+    let (schema_id, table_id) = finalize_table_snapshot(
+        catalog_id,
+        snapshot_id,
+        &mut schema_version,
+        &mut schema_changed,
+        schema_name,
+        table_name,
+        table_id_hint,
+        columns,
+        column_ids,
+        mode,
+        base_snapshot,
+        tx,
+    )
+    .await?;
+    Ok((snapshot_id, schema_id, table_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "ducklake.finalize_table_snapshot",
+    level = "info",
+    skip_all,
+    fields(catalog_id, schema_name, table_name)
+)]
+async fn finalize_table_snapshot(
+    catalog_id: i64,
+    snapshot_id: i64,
+    schema_version: &mut i64,
+    schema_changed: &mut bool,
+    schema_name: &str,
+    table_name: &str,
+    table_id_hint: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    mode: WriteMode,
+    base_snapshot: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(i64, i64)> {
     // 1. Resolve the live schema id under the lock. Reuse it if present; else
     //    reserve a fresh id from the sequence (the row is inserted in step 4 once
     //    the snapshot id exists for begin_snapshot).
@@ -1210,17 +1253,7 @@ async fn finalize_snapshot(
         }
     }
 
-    // 3. Allocate the snapshot id in commit order (plain IDENTITY). schema_version
-    //    is patched in below once we know it.
-    let snapshot_id: i64 = sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
-         VALUES (NOW(), 0) RETURNING snapshot_id",
-    )
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
-
-    // 4. Insert the schema row (with its reserved id) if it is new. The catalog id
+    // 3. Insert the schema row (with its reserved id) if it is new. The catalog id
     //    is encoded into the schema's *path* (not its name) so two catalogs holding
     //    their own `public` land in disjoint physical subtrees: the reader's
     //    resolution chain (`data_path + schema.path + table.path + file.path`) then
@@ -1250,7 +1283,7 @@ async fn finalize_snapshot(
         .await?;
     }
 
-    // 5. get-or-create table under the lock. Capture whether we created it.
+    // 4. Get or create the table under the lock.
     let (table_id, table_was_created): (i64, bool) = {
         let existing = sqlx::query(
             "SELECT table_id FROM ducklake_table
@@ -1280,7 +1313,7 @@ async fn finalize_snapshot(
         }
     };
 
-    // 6. Read the columns live AT COMMIT (under the lock) to classify DDL vs DML
+    // 5. Read the columns live at commit to classify DDL vs DML
     //    and drive the surgical column update below.
     let proposed = catalog_column_defs(columns)?;
     if proposed.len() != column_ids.len() {
@@ -1356,20 +1389,20 @@ async fn finalize_snapshot(
     .fetch_one(&mut **tx)
     .await?
     .try_get(0)?;
-    let new_schema_version = if is_ddl {
-        prev_max + 1
-    } else if prev_max == 0 {
-        1
-    } else {
-        prev_max
-    };
+    if *schema_version == 0 {
+        *schema_version = prev_max.max(1);
+    }
+    if is_ddl && !*schema_changed {
+        *schema_version = prev_max + 1;
+        *schema_changed = true;
+    }
     sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
-        .bind(new_schema_version)
+        .bind(*schema_version)
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
 
-    // 7. Write the column generation SURGICALLY (mode-independent, matching the
+    // 6. Write the column generation surgically (mode-independent, matching the
     //    SQLite writer) so each kept column keeps a STABLE column_id (== parquet
     //    field_id). End only removed columns, insert only genuinely-new ones (with
     //    their reserved ids), and sync order/nullability on the rest in place.
@@ -1476,20 +1509,20 @@ async fn finalize_snapshot(
         }
     }
 
-    // 8. One ducklake_schema_versions row per DDL (UNIQUE(table_id, begin_snapshot)).
+    // 7. Write one schema-version row per DDL
     if is_ddl {
         sqlx::query(
             "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
              VALUES ($1, $2, $3)",
         )
         .bind(snapshot_id)
-        .bind(new_schema_version)
+        .bind(*schema_version)
         .bind(table_id)
         .execute(&mut **tx)
         .await?;
     }
 
-    // 9. Replace retirement: end the prior generation's files + zero the visible
+    // 8. Retire the prior generation and zero visible totals for Replace
     //    totals. The `begin_snapshot < S` guard spares this write's own files.
     if mode == WriteMode::Replace {
         sqlx::query(
@@ -1528,7 +1561,7 @@ async fn finalize_snapshot(
         .await?;
     }
 
-    Ok((snapshot_id, schema_id, table_id))
+    Ok((schema_id, table_id))
 }
 
 /// Whether `snapshot_id` ended prior rows of the table — Parquet files or
@@ -1600,6 +1633,302 @@ async fn record_snapshot_changes(
     .bind(commit_metadata.extra_info())
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+async fn commit_files_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    write: &StagedTableWrite,
+    files: &[DataFileInfo],
+) -> Result<()> {
+    if files.is_empty() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "multi-table file stage must contain at least one file".to_string(),
+        ));
+    }
+    let live_partition_id: Option<i64> = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(write.table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    for file in files {
+        crate::metadata_writer::enforce_partition_fence(write.table_id, live_partition_id, file)?;
+    }
+    sqlx::query(
+        "INSERT INTO ducklake_table_stats
+             (table_id, record_count, next_row_id, file_size_bytes)
+         VALUES ($1, 0, 0, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(write.table_id)
+    .execute(&mut **tx)
+    .await?;
+    let mut next_row_id: i64 =
+        sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+            .bind(write.table_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let mut total_records = 0;
+    let mut total_bytes = 0;
+    for file in files {
+        let data_file_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ducklake_data_file
+                 (table_id, path, path_is_relative, file_size_bytes, footer_size,
+                  record_count, row_id_start, begin_snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING data_file_id",
+        )
+        .bind(write.table_id)
+        .bind(&file.path)
+        .bind(file.path_is_relative)
+        .bind(file.file_size_bytes)
+        .bind(file.footer_size)
+        .bind(file.record_count)
+        .bind(next_row_id)
+        .bind(snapshot_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
+        insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
+        next_row_id += file.record_count;
+        total_records += file.record_count;
+        total_bytes += file.file_size_bytes;
+    }
+    recompute_table_column_stats(tx, write.table_id, &write.columns, &write.column_ids).await?;
+    sqlx::query(
+        "UPDATE ducklake_table_stats
+         SET next_row_id = next_row_id + $1, record_count = record_count + $2,
+             file_size_bytes = file_size_bytes + $3
+         WHERE table_id = $4",
+    )
+    .bind(total_records)
+    .bind(total_records)
+    .bind(total_bytes)
+    .bind(write.table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn commit_inlined_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    write: &StagedTableWrite,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if record_count == 0 {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "multi-table inline stage must contain at least one row".to_string(),
+        ));
+    }
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let physical_name = format!(
+        "ducklake_inlined_data_{}_{}",
+        write.table_id, schema_version
+    );
+    let sql_types = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| inlined_postgres_type(field.data_type()))
+        .collect::<Vec<_>>();
+    let mut ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {} (\
+         row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+        quote_ident(&physical_name)
+    );
+    for ((column, _field), sql_type) in write
+        .columns
+        .iter()
+        .zip(batches[0].schema().fields())
+        .zip(&sql_types)
+    {
+        ddl.push_str(", ");
+        ddl.push_str(&quote_ident(column.name()));
+        ddl.push(' ');
+        ddl.push_str(sql_type);
+    }
+    ddl.push(')');
+    sqlx::query(AssertSqlSafe(ddl)).execute(&mut **tx).await?;
+    sqlx::query(
+        "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
+         SELECT $1, $2, $3
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_inlined_data_tables
+             WHERE table_id = $1 AND schema_version = $3
+         )",
+    )
+    .bind(write.table_id)
+    .bind(&physical_name)
+    .bind(schema_version)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_table_stats
+             (table_id, record_count, next_row_id, file_size_bytes)
+         VALUES ($1, 0, 0, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(write.table_id)
+    .execute(&mut **tx)
+    .await?;
+    let mut row_id: i64 =
+        sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+            .bind(write.table_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let column_list = write
+        .columns
+        .iter()
+        .map(|column| quote_ident(column.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for batch in batches {
+        for batch_row in 0..batch.num_rows() {
+            let mut query = QueryBuilder::<Postgres>::new(format!(
+                "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) VALUES (",
+                quote_ident(&physical_name),
+                column_list
+            ));
+            query.push_bind(row_id);
+            query.push(", ").push_bind(snapshot_id);
+            query.push(", NULL");
+            for (array, sql_type) in batch.columns().iter().zip(&sql_types) {
+                query.push(", ");
+                push_inlined_postgres_value(&mut query, array.as_ref(), batch_row, sql_type)?;
+            }
+            query.push(')');
+            query.build().execute(&mut **tx).await?;
+            row_id += 1;
+        }
+    }
+    let record_count = i64::try_from(record_count).map_err(|_| {
+        crate::DuckLakeError::InvalidConfig("multi-table inline row count exceeds i64".to_string())
+    })?;
+    sqlx::query(
+        "UPDATE ducklake_table_stats
+         SET next_row_id = next_row_id + $1, record_count = record_count + $2
+         WHERE table_id = $3",
+    )
+    .bind(record_count)
+    .bind(record_count)
+    .bind(write.table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn apply_positional_deletes_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    deletes: &[DeleteFileEntry],
+) -> Result<()> {
+    for entry in deletes {
+        let target_live: Option<i64> = sqlx::query_scalar(
+            "SELECT data_file_id FROM ducklake_data_file
+             WHERE data_file_id = $1 AND end_snapshot IS NULL",
+        )
+        .bind(entry.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if target_live.is_none() {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "DELETE on data file {} could not commit: the file is no longer live since snapshot {base_snapshot}",
+                entry.data_file_id
+            )));
+        }
+        let current_previous: Option<i64> = sqlx::query_scalar(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = $1 AND end_snapshot IS NULL",
+        )
+        .bind(entry.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if current_previous != entry.expected_prev_delete_file {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "DELETE on data file {} could not commit: its live delete file changed from {:?} to {current_previous:?} since snapshot {base_snapshot}",
+                entry.data_file_id, entry.expected_prev_delete_file
+            )));
+        }
+        if let Some(previous) = entry.expected_prev_delete_file {
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = $1
+                 WHERE delete_file_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(previous)
+            .execute(&mut **tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO ducklake_delete_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  footer_size, delete_count, begin_snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(entry.data_file_id)
+        .bind(table_id)
+        .bind(&entry.delete.path)
+        .bind(entry.delete.path_is_relative)
+        .bind(entry.delete.file_size_bytes)
+        .bind(entry.delete.footer_size)
+        .bind(entry.delete.delete_count)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn apply_inlined_deletes_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    deletes: &[InlinedRowRef],
+) -> Result<()> {
+    let registered =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get(0))
+            .collect::<std::result::Result<std::collections::HashSet<String>, _>>()?;
+    for row in deletes {
+        if !registered.contains(&row.table_name) {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} belongs to an unregistered table '{}'",
+                row.row_id, row.table_name
+            )));
+        }
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = $1
+             WHERE row_id = $2 AND begin_snapshot <= $3 AND end_snapshot IS NULL",
+            quote_ident(&row.table_name)
+        );
+        let affected = sqlx::query(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .bind(row.row_id)
+            .bind(base_snapshot)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        if affected != 1 {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
+                row.row_id, row.table_name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2488,6 +2817,170 @@ impl MetadataWriter for PostgresMetadataWriter {
                 snapshot_id,
                 schema_id,
                 table_id,
+            })
+        })
+    }
+
+    fn commit_multi_table(
+        &self,
+        writes: &[StagedTableWrite],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        if writes.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_multi_table requires at least one table stage".to_string(),
+            ));
+        }
+        let table_ids = writes
+            .iter()
+            .map(|write| write.table_id)
+            .collect::<std::collections::HashSet<_>>();
+        if table_ids.len() != writes.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_multi_table requires one stage per table".to_string(),
+            ));
+        }
+
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            for write in writes {
+                assert_table_not_in_other_catalog(self.catalog_id, write.table_id, &mut tx).await?;
+            }
+            if let Some(expected) = expected_base_snapshot_id {
+                for write in writes {
+                    detect_replace_conflict(write.table_id, expected, &mut tx).await?;
+                }
+            }
+            let mut had_live_data = Vec::with_capacity(writes.len());
+            for write in writes {
+                let files: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM ducklake_data_file
+                         WHERE table_id = $1 AND end_snapshot IS NULL
+                     )",
+                )
+                .bind(write.table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let mut inline_rows = 0i64;
+                let inline_tables = sqlx::query(
+                    "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+                )
+                .bind(write.table_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in inline_tables {
+                    let table_name: String = row.try_get(0)?;
+                    let sql = format!(
+                        "SELECT COUNT(*)::BIGINT FROM {} WHERE end_snapshot IS NULL",
+                        quote_ident(&table_name)
+                    );
+                    inline_rows += sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
+                        .fetch_one(&mut *tx)
+                        .await?;
+                }
+                had_live_data.push(files || inline_rows > 0);
+            }
+            let snapshot_id: i64 = sqlx::query_scalar(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut schema_version = 0;
+            let mut schema_changed = false;
+            let mut committed_writes = Vec::with_capacity(writes.len());
+            let mut tables = Vec::with_capacity(writes.len());
+            for write in writes {
+                let (schema_id, table_id) = finalize_table_snapshot(
+                    self.catalog_id,
+                    snapshot_id,
+                    &mut schema_version,
+                    &mut schema_changed,
+                    &write.schema_name,
+                    &write.table_name,
+                    write.table_id,
+                    &write.columns,
+                    &write.column_ids,
+                    write.mode,
+                    write.base_snapshot_id,
+                    &mut tx,
+                )
+                .await?;
+                let mut committed_write = write.clone();
+                committed_write.table_id = table_id;
+                committed_writes.push(committed_write);
+                tables.push(CommitIds {
+                    snapshot_id,
+                    schema_id,
+                    table_id,
+                });
+            }
+
+            for (write, replaced_existing_data) in committed_writes.iter().zip(had_live_data) {
+                match &write.data {
+                    StagedTableData::Files(files) => {
+                        commit_files_at_snapshot(&mut tx, snapshot_id, write, files).await?;
+                    },
+                    StagedTableData::Inlined(batches) => {
+                        commit_inlined_at_snapshot(&mut tx, snapshot_id, write, batches).await?;
+                    },
+                    StagedTableData::None => {},
+                }
+                apply_positional_deletes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.positional_deletes,
+                )
+                .await?;
+                apply_inlined_deletes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.inlined_deletes,
+                )
+                .await?;
+                if !write.inlined_deletes.is_empty() {
+                    let deleted = i64::try_from(write.inlined_deletes.len()).map_err(|_| {
+                        crate::DuckLakeError::InvalidConfig(
+                            "multi-table inline delete count exceeds i64".to_string(),
+                        )
+                    })?;
+                    sqlx::query(
+                        "UPDATE ducklake_table_stats
+                         SET record_count = GREATEST(record_count - $1, 0)
+                         WHERE table_id = $2",
+                    )
+                    .bind(deleted)
+                    .bind(write.table_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                let has_deletes =
+                    !write.positional_deletes.is_empty() || !write.inlined_deletes.is_empty();
+                let changes_made = if matches!(&write.data, StagedTableData::None) {
+                    format!("deleted_from_table:{}", write.table_id)
+                } else {
+                    table_write_changes(
+                        write.table_id,
+                        write.mode,
+                        has_deletes,
+                        replaced_existing_data,
+                    )
+                };
+                record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata)
+                    .await?;
+            }
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+            tx.commit().await?;
+            Ok(MultiTableCommit {
+                snapshot_id,
+                tables,
             })
         })
     }

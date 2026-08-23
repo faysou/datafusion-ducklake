@@ -137,8 +137,9 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, MetadataWriter, SnapshotCommitMetadata, SourceRetirement,
-    WriteMode, WriteResult, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
+    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, WriteMode,
+    WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;
@@ -158,7 +159,8 @@ pub use multicatalog_provider::MulticatalogProvider;
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, TableWriteOptions, TableWriteSession,
+    DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, TableWriteOptions,
+    TableWriteSession,
 };
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;

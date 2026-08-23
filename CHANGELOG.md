@@ -19,8 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit both forms in one snapshot on all four write backends: DuckDB and
   MySQL implement `commit_deletes`, and truncate ends visible inline rows and
   returns the exact live row count, inline rows included (#273).
+- `DuckLakeWriteTransaction` stages Parquet files, inlined rows, and deletes for
+  several tables, then commits them in one DuckDB, SQLite, PostgreSQL, or MySQL
+  metadata transaction and one snapshot. A shared write precondition rejects
+  the complete commit before mutation, and a failed commit removes every
+  staged Parquet data or delete object.
 
 ### Changed
+
+- A failed `DuckLakeWriteTransaction` commit removes its staged Parquet data
+  and delete objects only on a definite pre-commit rejection (conflict,
+  validation, or unsupported-operation error). An ambiguous failure, such as a
+  lost COMMIT acknowledgement on a network backend, leaves the objects to the
+  guarded vacuum so a commit that actually landed never references deleted
+  files (#274).
 
 - Small writes at or below `data_inlining_row_limit` inline only when the
   writer's schema-aware `supports_data_inlining` probe accepts the schema;
@@ -35,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The MySQL multi-table commit allocates its snapshot — taking the serializing
+  counter lock — before any fence or liveness read, so a concurrent committer
+  can no longer pass the fence on a stale InnoDB read view or allocate an
+  overlapping `row_id` range (#274).
+- A multi-table commit that creates several tables in a fresh schema records
+  the schema's `created_schema:` ledger entry exactly once (#274).
 - MySQL allocates every `data_file_id` and `delete_file_id` from the catalog
   counters instead of mixing auto-increment appends with counter-seeded
   explicit ids, removing certain primary-key collisions between the append and

@@ -28,9 +28,9 @@ use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions,
-    MetadataWriter, SnapshotCommitMetadata, SqliteMetadataProvider, SqliteMetadataWriter,
-    WriteMode,
+    ColumnDef, DeleteFileEntry, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter,
+    DuckLakeWriteOptions, InlinedRowRef, MetadataProvider, MetadataWriter, SnapshotCommitMetadata,
+    SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, WriteMode,
 };
 
 fn table_schema() -> Arc<Schema> {
@@ -67,6 +67,28 @@ async fn make_writer(t: &TempDir) -> SqliteMetadataWriter {
         .unwrap();
     w.set_data_path(data.to_str().unwrap()).unwrap();
     w
+}
+
+fn create_empty_table(writer: &SqliteMetadataWriter, table_name: &str) {
+    let columns = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", table_name, &columns, WriteMode::Append)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            table_name,
+            setup.snapshot_id,
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
 }
 
 /// `(id, val)` from `main.t`, ascending, as of `snapshot` (or latest).
@@ -316,6 +338,352 @@ async fn writer_inlines_at_limit_and_uses_parquet_outside_limit() {
     assert_eq!(disabled_result.records_written, 1);
 }
 
+/// A fence-rejected multi-table commit is a DEFINITE rollback: nothing is
+/// visible on either table and the staged Parquet objects are removed (only an
+/// ambiguous commit failure leaves them to the guarded vacuum).
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicted_multi_table_commit_leaves_no_partial_state_and_no_staged_files() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    create_empty_table(&writer, "data");
+    create_empty_table(&writer, "coverage");
+    let provider = SqliteMetadataProvider::new(&rw_url(&temp)).await.unwrap();
+    let base = provider.get_current_snapshot().unwrap();
+
+    let writer: Arc<dyn MetadataWriter> = writer;
+    let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store()).unwrap();
+    let options = TableWriteOptions::new().with_expected_base_snapshot_id(base);
+    let mut transaction = table_writer.transaction().with_options(&options);
+    transaction
+        .stage_write(
+            "main",
+            "data",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1], vec![10])],
+        )
+        .await
+        .unwrap();
+
+    // A concurrent commit moves the staged table's generation past the
+    // fenced base (the fence is per staged table).
+    let concurrent = DuckLakeTableWriter::new(Arc::clone(&writer), object_store()).unwrap();
+    concurrent
+        .append_table("main", "data", &[batch(vec![9], vec![90])])
+        .await
+        .unwrap();
+
+    let error = transaction.commit().await.unwrap_err();
+    assert!(
+        matches!(error, DuckLakeError::Conflict(_)),
+        "expected Conflict, got {error:?}"
+    );
+    // Only the concurrent append's file survives; the rejected stage's
+    // Parquet object is removed (definite rollback -> cleanup).
+    let staged_parquet = walkdir_parquet(&temp.path().join("data").join("main").join("data"));
+    assert_eq!(
+        staged_parquet, 1,
+        "the fence-rejected stage's Parquet object must be removed"
+    );
+}
+
+fn walkdir_parquet(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                walkdir_parquet(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|ext| ext == "parquet"))
+            }
+        })
+        .sum()
+}
+
+/// One multi-table commit creating two tables in a fresh schema records the
+/// schema's creation exactly once in the snapshot ledger.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_table_commit_records_created_schema_once() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let table_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let mut transaction = table_writer.transaction();
+    for table_name in ["t1", "t2"] {
+        transaction
+            .stage_write(
+                "s2",
+                table_name,
+                table_schema().as_ref(),
+                WriteMode::Append,
+                &[batch(vec![1], vec![10])],
+            )
+            .await
+            .unwrap();
+    }
+
+    let results = transaction.commit().await.unwrap();
+
+    assert_eq!(results.len(), 2);
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(results[0].snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        changes.matches("created_schema:\"s2\"").count(),
+        1,
+        "one commit records one schema creation: {changes}"
+    );
+    assert_eq!(
+        changes,
+        format!(
+            "created_schema:\"s2\",created_table:\"s2\".\"t1\",created_table:\"s2\".\"t2\",\
+             inserted_into_table:{},inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_table_write_commits_parquet_and_inline_rows_in_one_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    create_empty_table(&writer, "data");
+    create_empty_table(&writer, "coverage");
+    let data_options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(0),
+        ..Default::default()
+    };
+    let coverage_options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let table_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let mut transaction = table_writer.transaction();
+    transaction
+        .stage_write_with_options(
+            "main",
+            "data",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1], vec![10])],
+            &data_options,
+        )
+        .await
+        .unwrap();
+    transaction
+        .stage_write_with_options(
+            "main",
+            "coverage",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1], vec![10])],
+            &coverage_options,
+        )
+        .await
+        .unwrap();
+
+    let results = transaction.commit().await.unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    assert_eq!(results[0].files_written, 1);
+    assert_eq!(results[1].files_written, 0);
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let inlined_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_inlined_data_tables")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(results[0].snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshots, 3);
+    assert_eq!(files, 1);
+    assert_eq!(inlined_tables, 1);
+    assert_eq!(
+        changes,
+        format!(
+            "inserted_into_table:{},inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_table_fence_rejection_removes_staged_parquet_file() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    create_empty_table(&writer, "coverage");
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options);
+    let initial = table_writer
+        .append_table("main", "data", &[batch(vec![1, 2, 3], vec![10, 20, 30])])
+        .await
+        .unwrap();
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let (data_file_id, data_file_path): (i64, String) = sqlx::query_as(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(initial.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = table_writer
+        .write_delete_file("main", "data", &data_file_path, &[0])
+        .await
+        .unwrap();
+    let deletes = [DeleteFileEntry {
+        data_file_id,
+        expected_prev_delete_file: None,
+        delete,
+    }];
+    let transaction_options =
+        TableWriteOptions::new().with_expected_base_snapshot_id(initial.snapshot_id);
+    let mut transaction = table_writer
+        .transaction()
+        .with_options(&transaction_options);
+    transaction
+        .stage_write_with_deletes(
+            "main",
+            "data",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![4, 5, 6], vec![40, 50, 60])],
+            &deletes,
+            &[],
+        )
+        .await
+        .unwrap();
+    transaction
+        .stage_write(
+            "main",
+            "coverage",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![1], vec![10])],
+        )
+        .await
+        .unwrap();
+    table_writer
+        .append_table("main", "data", &[batch(vec![7, 8, 9], vec![70, 80, 90])])
+        .await
+        .unwrap();
+
+    let error = transaction.commit().await.unwrap_err();
+
+    assert!(error.to_string().contains("conflict"));
+    let data_dir = temp.path().join("data/main/data");
+    let parquet_files = std::fs::read_dir(data_dir)
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+        .count();
+    assert_eq!(parquet_files, 2);
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_inlined_data_tables tables
+         JOIN ducklake_table table_meta ON table_meta.table_id = tables.table_id
+         WHERE table_meta.table_name = 'coverage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(coverage_rows, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_table_delete_only_stage_ends_inline_row() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    create_empty_table(&writer, "data");
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options);
+    let coverage = table_writer
+        .append_table("main", "coverage", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let physical_name: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(coverage.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let row_id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT row_id FROM {physical_name} WHERE id = 1 AND end_snapshot IS NULL"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut transaction = table_writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "data",
+            table_schema().as_ref(),
+            WriteMode::Append,
+            &[batch(vec![3, 4, 5], vec![30, 40, 50])],
+        )
+        .await
+        .unwrap();
+    transaction
+        .stage_deletes(
+            "main",
+            "coverage",
+            table_schema().as_ref(),
+            &[],
+            &[InlinedRowRef {
+                table_name: physical_name.clone(),
+                row_id,
+            }],
+        )
+        .unwrap();
+
+    let results = transaction.commit().await.unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    let live_ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT id FROM {physical_name} WHERE end_snapshot IS NULL ORDER BY id"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_ids, vec![2]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_inlined_uint64_round_trips_text_storage() {
     let temp = TempDir::new().unwrap();
@@ -334,18 +702,17 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
         vec![Arc::new(UInt64Array::from(vec![u64::MAX]))],
     )
     .unwrap();
-
     DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .with_options(&options)
         .append_table("main", "uint64_values", &[batch])
         .await
         .unwrap();
-
     let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let context = SessionContext::new();
     context.register_catalog("ducklake", Arc::new(catalog));
+
     let batches = context
         .sql("SELECT value FROM ducklake.main.uint64_values")
         .await
