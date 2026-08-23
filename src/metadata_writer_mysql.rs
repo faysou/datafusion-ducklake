@@ -1846,9 +1846,18 @@ async fn commit_staged_inline(
             query.push_bind(row_id);
             query.push(", ").push_bind(snapshot_id);
             query.push(", NULL");
-            for array in batch.columns() {
+            for (array, column) in batch.columns().iter().zip(&write.columns) {
                 query.push(", ");
-                push_inlined_mysql_value(&mut query, array.as_ref(), batch_row)?;
+                if write
+                    .snapshot_id_columns
+                    .iter()
+                    .any(|name| name == column.name())
+                    && array.is_null(batch_row)
+                {
+                    query.push_bind(snapshot_id);
+                } else {
+                    push_inlined_mysql_value(&mut query, array.as_ref(), batch_row)?;
+                }
             }
             query.push(')');
             query.build().execute(&mut **tx).await?;

@@ -1799,9 +1799,20 @@ async fn commit_inlined_at_snapshot(
             query.push_bind(row_id);
             query.push(", ").push_bind(snapshot_id);
             query.push(", NULL");
-            for (array, sql_type) in batch.columns().iter().zip(&sql_types) {
+            for ((array, sql_type), column) in
+                batch.columns().iter().zip(&sql_types).zip(&write.columns)
+            {
                 query.push(", ");
-                push_inlined_postgres_value(&mut query, array.as_ref(), batch_row, sql_type)?;
+                if write
+                    .snapshot_id_columns
+                    .iter()
+                    .any(|name| name == column.name())
+                    && array.is_null(batch_row)
+                {
+                    query.push_bind(snapshot_id);
+                } else {
+                    push_inlined_postgres_value(&mut query, array.as_ref(), batch_row, sql_type)?;
+                }
             }
             query.push(')');
             query.build().execute(&mut **tx).await?;

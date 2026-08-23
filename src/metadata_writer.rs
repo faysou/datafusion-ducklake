@@ -1039,6 +1039,7 @@ pub struct StagedTableWrite {
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) column_ids: Vec<i64>,
     pub(crate) data: StagedTableData,
+    pub(crate) snapshot_id_columns: Vec<String>,
     pub(crate) positional_deletes: Vec<DeleteFileEntry>,
     pub(crate) inlined_deletes: Vec<InlinedRowRef>,
 }

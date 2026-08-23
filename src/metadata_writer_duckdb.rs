@@ -1650,8 +1650,17 @@ fn commit_staged_inline(
             values.push(Value::BigInt(row_id));
             values.push(Value::BigInt(snapshot_id));
             values.push(Value::Null);
-            for array in batch.columns() {
-                values.push(inlined_duckdb_value(array.as_ref(), batch_row)?);
+            for (array, column) in batch.columns().iter().zip(&write.columns) {
+                if write
+                    .snapshot_id_columns
+                    .iter()
+                    .any(|name| name == column.name())
+                    && array.is_null(batch_row)
+                {
+                    values.push(Value::BigInt(snapshot_id));
+                } else {
+                    values.push(inlined_duckdb_value(array.as_ref(), batch_row)?);
+                }
             }
             tx.execute(&insert_sql, params_from_iter(values))?;
             row_id += 1;

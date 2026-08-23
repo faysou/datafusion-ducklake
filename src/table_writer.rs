@@ -1577,6 +1577,7 @@ impl DuckLakeTableWriter {
                     columns,
                     column_ids: setup.column_ids,
                     data: StagedTableData::Inlined(batches.to_vec()),
+                    snapshot_id_columns: Vec::new(),
                     positional_deletes: Vec::new(),
                     inlined_deletes: Vec::new(),
                 },
@@ -1662,6 +1663,7 @@ impl DuckLakeTableWriter {
                 columns,
                 column_ids: setup.field_ids,
                 data: StagedTableData::Files(file_infos),
+                snapshot_id_columns: Vec::new(),
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
             },
@@ -1859,6 +1861,105 @@ impl DuckLakeWriteTransaction<'_> {
         Ok(())
     }
 
+    /// Stages an inline write whose nullable snapshot columns use the commit snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_write_with_snapshot_columns(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+        options: &DuckLakeWriteOptions,
+        snapshot_id_columns: &[&str],
+    ) -> Result<()> {
+        let writer = self.writer.clone().with_options(options);
+        let mut prepared = writer
+            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .await?;
+        if !matches!(&prepared.write.data, StagedTableData::Inlined(_)) {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit snapshot columns require an inlined table stage".to_string(),
+            ));
+        }
+        for name in snapshot_id_columns {
+            if !prepared
+                .write
+                .columns
+                .iter()
+                .any(|column| column.name() == *name)
+            {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "commit snapshot column '{name}' is not present in the staged schema"
+                )));
+            }
+        }
+        prepared.write.snapshot_id_columns = snapshot_id_columns
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        self.writes.push(prepared);
+        Ok(())
+    }
+
+    /// Stages an inline write with deletes and commit-snapshot columns.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_write_with_deletes_and_snapshot_columns(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+        positional_deletes: &[DeleteFileEntry],
+        inlined_deletes: &[InlinedRowRef],
+        options: &DuckLakeWriteOptions,
+        snapshot_id_columns: &[&str],
+    ) -> Result<()> {
+        if !positional_deletes.is_empty() {
+            validate_delete_entries(mode, positional_deletes)?;
+        }
+        if inlined_deletes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != inlined_deletes.len()
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "multi-table write contains duplicate inlined deletes".to_string(),
+            ));
+        }
+        let delete_paths = positional_deletes
+            .iter()
+            .map(|entry| {
+                self.writer.staged_object_path(
+                    schema_name,
+                    table_name,
+                    &entry.delete.path,
+                    entry.delete.path_is_relative,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.stage_write_with_snapshot_columns(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            batches,
+            options,
+            snapshot_id_columns,
+        )
+        .await?;
+        let prepared = self
+            .writes
+            .last_mut()
+            .expect("snapshot-column stage appended one table");
+        prepared.object_paths.extend(delete_paths);
+        prepared.write.positional_deletes = positional_deletes.to_vec();
+        prepared.write.inlined_deletes = inlined_deletes.to_vec();
+        Ok(())
+    }
+
     /// Stages inserted rows and deletes for one table.
     ///
     /// The transaction takes ownership of the positional delete objects and removes them if the
@@ -1967,6 +2068,7 @@ impl DuckLakeWriteTransaction<'_> {
                 columns,
                 column_ids: setup.field_ids,
                 data: StagedTableData::None,
+                snapshot_id_columns: Vec::new(),
                 positional_deletes: positional_deletes.to_vec(),
                 inlined_deletes: inlined_deletes.to_vec(),
             },

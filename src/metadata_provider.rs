@@ -627,7 +627,9 @@ pub(crate) fn inlined_delete_table_name(table_id: i64) -> Result<String> {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InlinedDataBackend {
+    #[cfg_attr(not(feature = "metadata-postgres"), allow(dead_code))]
     Postgres,
+    #[cfg_attr(not(feature = "metadata-mysql"), allow(dead_code))]
     MySql,
 }
 

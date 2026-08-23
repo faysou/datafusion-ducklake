@@ -16,8 +16,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryViewArray, Float32Array, Float64Array, Int32Array, TimestampMicrosecondArray,
-    UInt64Array,
+    Array, BinaryViewArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    TimestampMicrosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -729,6 +729,82 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
         .downcast_ref::<UInt64Array>()
         .unwrap();
     assert_eq!(values.value(0), u64::MAX);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_snapshot_column_uses_the_committed_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("version", DataType::Int64, true),
+    ]));
+    let columns = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("version", &DataType::Int64, true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "versioned", &columns, WriteMode::Append)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "versioned",
+            setup.snapshot_id,
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let options = DuckLakeWriteOptions {
+        data_inlining_row_limit: Some(2),
+        ..Default::default()
+    };
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![None, Some(77)])),
+        ],
+    )
+    .unwrap();
+    let table_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let mut transaction = table_writer.transaction();
+    transaction
+        .stage_write_with_snapshot_columns(
+            "main",
+            "versioned",
+            schema.as_ref(),
+            WriteMode::Append,
+            &[batch],
+            &options,
+            &["version"],
+        )
+        .await
+        .unwrap();
+
+    let committed = transaction.commit().await.unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    let batches = context
+        .sql("SELECT version FROM ducklake.main.versioned ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let versions = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(versions.values(), &[committed[0].snapshot_id, 77]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
