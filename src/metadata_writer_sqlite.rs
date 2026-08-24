@@ -2,6 +2,13 @@
 //!
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
+use std::{
+    fs::{File, OpenOptions},
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
+
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{
@@ -27,7 +34,7 @@ use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::QueryBuilder;
 use sqlx::Row;
-use sqlx::sqlite::{Sqlite, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -511,6 +518,8 @@ CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataWriter {
     pool: SqlitePool,
+    lock_path: Option<PathBuf>,
+    commit_lock: Arc<Mutex<()>>,
 }
 
 impl SqliteMetadataWriter {
@@ -522,6 +531,11 @@ impl SqliteMetadataWriter {
         connection_string: &str,
         max_connections: u32,
     ) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(connection_string)?;
+        let filename = options.get_filename();
+        let lock_path = (!filename.as_os_str().is_empty()
+            && filename != std::path::Path::new(":memory:"))
+        .then(|| filename.with_extension("commit.lock"));
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect(connection_string)
@@ -531,6 +545,8 @@ impl SqliteMetadataWriter {
         migrate_snapshot_changes_nullable(&pool).await?;
         Ok(Self {
             pool,
+            lock_path,
+            commit_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -2359,6 +2375,69 @@ impl MetadataWriter for SqliteMetadataWriter {
     /// row-level `UPDATE`.
     fn supports_update(&self) -> bool {
         true
+    }
+
+    fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let table_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = ?)",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !table_exists {
+                return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(key)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES (?, ?, 'table', ?)",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn with_commit_lock(
+        &self,
+        _identity: &str,
+        operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        if let Some(lock_path) = &self.lock_path {
+            let lock_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .truncate(false)
+                .write(true)
+                .open(lock_path)?;
+            File::lock(&lock_file)?;
+            let result = operation();
+            let unlock = File::unlock(&lock_file);
+            return match (result, unlock) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(e)) => Err(e.into()),
+                (Err(e), _) => Err(e),
+            };
+        }
+
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            crate::DuckLakeError::Internal("SQLite commit lock is poisoned".to_string())
+        })?;
+        operation()
     }
 
     fn create_snapshot(&self) -> Result<i64> {

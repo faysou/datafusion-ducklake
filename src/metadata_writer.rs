@@ -1147,6 +1147,38 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;
 
+    /// Replace a table-scoped catalog setting.
+    fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "table-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Run an operation while holding a backend-appropriate commit lock.
+    ///
+    /// A coordination utility for callers that want to serialize a multi-step
+    /// commit workflow (e.g. read staged state, dedup, commit) under one
+    /// `identity` across processes. Correctness does not depend on it: the
+    /// optimistic `expected_base_snapshot_id` fence remains the conflict
+    /// mechanism, and this lock only avoids duplicate concurrent work.
+    ///
+    /// Contract: the lock is held for the duration of `operation` and released
+    /// on both success and error before this returns; an `operation` error
+    /// propagates and takes precedence over a release error. A crashed holder
+    /// must not leave the lock held (backends use self-releasing mechanisms:
+    /// an advisory transaction lock, a file lock released on close). Keep
+    /// critical sections short — implementations may pin a connection while
+    /// the lock is held.
+    fn with_commit_lock(
+        &self,
+        _identity: &str,
+        _operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "commit locking is not supported by this metadata backend".to_string(),
+        ))
+    }
+
     /// Get or create a schema, returning `(schema_id, was_created)`.
     fn get_or_create_schema(
         &self,

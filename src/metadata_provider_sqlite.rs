@@ -8,9 +8,9 @@ use crate::metadata_provider::{
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, MetadataProvider, MetadataSetting, SQL_GET_FILE_PARTITION_VALUES,
     SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
-    block_on, inlined_delete_table_name, inlined_missing_scalar, reconstruct_columns,
-    reconstruct_columns_with_table, resolve_metadata_settings,
+    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, inlined_missing_scalar,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -425,6 +425,62 @@ impl MetadataProvider for SqliteMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT snapshot.snapshot_id,
+                        CAST(snapshot.snapshot_time AS TEXT) AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM ducklake_snapshot AS snapshot
+                 JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT changes.snapshot_id
+                 FROM ducklake_snapshot_changes AS changes
+                 WHERE (changes.commit_extra_info = ?
+                        OR instr(changes.commit_extra_info, ?) > 0)
+                   AND EXISTS (
+                       SELECT 1 FROM ducklake_data_file AS files
+                       WHERE files.begin_snapshot = changes.snapshot_id
+                         AND files.end_snapshot IS NULL
+                   )
+                 ORDER BY changes.snapshot_id
+                 LIMIT 1",
+            )
+            .bind(needle)
+            .bind(needle)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
         })
     }
 
@@ -1339,14 +1395,14 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .map(|column| quote_ident(&column.column_name))
                     .collect::<Vec<_>>();
                 let select_list = if projected.is_empty() {
-                    "row_id".to_string()
+                    "row_id, begin_snapshot".to_string()
                 } else {
-                    format!("row_id, {}", projected.join(", "))
+                    format!("row_id, begin_snapshot, {}", projected.join(", "))
                 };
                 let sql = format!(
                     "SELECT {select_list} FROM {} \
                      WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
-                     ORDER BY row_id",
+                 ORDER BY begin_snapshot, row_id",
                     quote_ident(&physical_name)
                 );
                 let rows = sqlx::query(AssertSqlSafe(sql))
@@ -1361,9 +1417,14 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .iter()
                     .map(|row| row.try_get("row_id"))
                     .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let begin_snapshots = rows
+                    .iter()
+                    .map(|row| row.try_get("begin_snapshot"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
                 batches.push(DuckLakeInlinedData {
                     table_name: physical_name,
                     row_ids,
+                    begin_snapshots,
                     batch: build_inlined_batch(&schema, columns, &present, &rows)?,
                 });
             }

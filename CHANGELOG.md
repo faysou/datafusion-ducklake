@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data_inlining_row_limit`. Small writes can stay in the metadata catalog with
   stable row IDs, snapshot visibility, table statistics, mixed positional and
   inline deletes, and DuckDB extension interoperability.
+- Metadata access APIs for embedding catalogs: `MetadataProvider::list_snapshot_changes`
+  exposes the snapshot change ledger (`ducklake_snapshot_changes`) column-for-column,
+  `MetadataProvider::find_snapshot_by_commit_extra_info` finds the first live-data snapshot
+  whose opaque `commit_extra_info` equals or contains a caller-supplied needle,
+  `MetadataWriter::set_table_setting` upserts a table-scoped `ducklake_metadata` setting, and
+  `MetadataWriter::with_commit_lock` runs an operation under a backend-appropriate commit
+  coordination lock (PostgreSQL advisory transaction lock, SQLite file lock) with the lock
+  released on success and error and the operation's error taking precedence. Implemented for
+  SQLite and PostgreSQL with shared contract tests; other backends keep `Unsupported`
+  defaults (#274).
 - SQL `DELETE` predicates spanning Parquet-resident and catalog-inlined rows
   commit both forms in one snapshot on all four write backends: DuckDB and
   MySQL implement `commit_deletes`, and truncate ends visible inline rows and

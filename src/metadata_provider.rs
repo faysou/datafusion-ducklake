@@ -396,6 +396,23 @@ pub struct SnapshotMetadata {
     pub timestamp: Option<String>,
 }
 
+/// Change ledger entry associated with a DuckLake snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotChangeMetadata {
+    /// Unique identifier for the snapshot.
+    pub snapshot_id: i64,
+    /// Timestamp when the snapshot was created.
+    pub timestamp: Option<String>,
+    /// Comma-separated DuckLake change tokens.
+    pub changes_made: String,
+    /// Optional commit author.
+    pub author: Option<String>,
+    /// Optional commit message.
+    pub commit_message: Option<String>,
+    /// Optional application-defined commit metadata.
+    pub commit_extra_info: Option<String>,
+}
+
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
     let mut timestamp = raw.trim();
     for suffix in ["Z", " UTC", "+00:00", "+00"] {
@@ -824,6 +841,8 @@ pub struct DuckLakeInlinedData {
     pub table_name: String,
     /// Stable DuckLake row ids, aligned with `batch` rows.
     pub row_ids: Vec<i64>,
+    /// Snapshot that introduced each row, aligned with `batch` rows.
+    pub begin_snapshots: Vec<i64>,
     /// Physical table columns in catalog order.
     pub batch: arrow::record_batch::RecordBatch,
 }
@@ -1403,6 +1422,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List all snapshots in the catalog
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>>;
+
+    /// List snapshot change-ledger entries in snapshot order.
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        Ok(Vec::new())
+    }
+
+    /// Find the first snapshot with live data files whose `commit_extra_info`
+    /// equals or contains `needle`.
+    ///
+    /// `commit_extra_info` is opaque to DuckLake; the caller owns its format
+    /// and supplies the exact needle to match (including any delimiters its
+    /// own convention uses to make substring matches unambiguous).
+    fn find_snapshot_by_commit_extra_info(&self, _needle: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
 
     /// List schemas for a specific snapshot
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>>;

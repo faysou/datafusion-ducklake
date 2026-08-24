@@ -1944,6 +1944,58 @@ async fn apply_inlined_deletes_at_snapshot(
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
+    fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut transaction).await?;
+
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = $1 AND scope = 'table' AND scope_id = $2",
+            )
+            .bind(key)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES ($1, $2, 'table', $3)",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn with_commit_lock(
+        &self,
+        identity: &str,
+        operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let lock_key = format!("{}:{identity}", self.catalog_id);
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(lock_key)
+                .execute(&mut *transaction)
+                .await?;
+            let result = operation();
+            // The advisory lock is transaction-scoped; rollback releases it on
+            // both paths, and an operation error takes precedence.
+            let unlock = transaction.rollback().await;
+            match (result, unlock) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(e)) => Err(e.into()),
+                (Err(e), _) => Err(e),
+            }
+        })
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;

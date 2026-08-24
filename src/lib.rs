@@ -110,7 +110,9 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
-pub use metadata_provider::{DuckLakeFileData, DuckLakeTableFile, MetadataProvider};
+pub use metadata_provider::{
+    DuckLakeFileData, DuckLakeTableFile, MetadataProvider, SnapshotChangeMetadata,
+};
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
