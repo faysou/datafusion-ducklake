@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data_inlining_row_limit`. Small writes can stay in the metadata catalog with
   stable row IDs, snapshot visibility, table statistics, mixed positional and
   inline deletes, and DuckDB extension interoperability.
+- Catalog-inlined scans can push equality, range, null, conjunction,
+  disjunction, and case-sensitive prefix filters into parameterized SQLite,
+  PostgreSQL, DuckDB, and MySQL metadata queries. Unsupported expressions and
+  unsafe physical encodings fail open per predicate, while DataFusion retains
+  every filter as `Inexact`. The additive provider scan contract reports how
+  many inline rows were materialized before residual filtering.
+
 - Metadata access APIs for embedding catalogs: `MetadataProvider::list_snapshot_changes`
   exposes the snapshot change ledger (`ducklake_snapshot_changes`) column-for-column,
   `MetadataProvider::find_snapshot_by_commit_extra_info` finds the first live-data snapshot

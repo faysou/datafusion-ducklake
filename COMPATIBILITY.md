@@ -126,6 +126,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations) | ✅ |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
+| Filter pushdown to catalog-inlined rows (equality, range, null, AND, OR, and prefix) | ✅ |
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
 | Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
 | SQL-queryable `information_schema`                      |   ✅   |
@@ -310,6 +311,13 @@ Known edges:
   unsupported for inlined rows. Non‑scalar inlined columns fail with an
   error that directs users to flush the rows to Parquet or disable inlining at
   write time.
+  Inlined scans conservatively push equality, range, null, conjunction,
+  disjunction, and case-sensitive prefix predicates into parameterized catalog
+  SQL. Supported `AND` children push independently; `OR` pushes only when every
+  branch is supported. DataFusion reapplies every filter. A physical schema or
+  backend encoding that cannot preserve DataFusion comparison semantics falls
+  back to materializing those rows. Projection pushdown and automatic physical
+  index creation are not implemented.
 - **The change feed does not surface inlined deletes.** `ducklake_table_changes`
   and `ducklake_table_deletions` read delete *files* added in the window; a
   snapshot whose only change is an inlined Parquet‑row delete emits no `delete`

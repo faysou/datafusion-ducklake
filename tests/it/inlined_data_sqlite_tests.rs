@@ -27,6 +27,7 @@ use sqlx::AssertSqlSafe;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
+use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
 use datafusion_ducklake::{
     ColumnDef, DeleteFileEntry, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter,
     DuckLakeWriteOptions, InlinedRowRef, MetadataProvider, MetadataWriter, SnapshotCommitMetadata,
@@ -163,6 +164,72 @@ async fn seed_inlined(
         .await
         .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_inlined_scan_pushes_supported_filters_and_falls_back_per_table() {
+    let temp = TempDir::new().unwrap();
+    let writer = make_writer(&temp).await;
+    create_empty_table(&writer, "t");
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_name = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let snapshot_id: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    seed_inlined(
+        &pool,
+        table_id,
+        &[(0, snapshot_id, None, 1, 10), (1, snapshot_id, None, 2, 20)],
+    )
+    .await;
+    let provider = SqliteMetadataProvider::new(&rw_url(&temp)).await.unwrap();
+    let columns = provider.get_table_structure(table_id, snapshot_id).unwrap();
+    let pushed = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(pushed.materialized_row_count, 1);
+
+    let range = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(range.materialized_row_count, 1);
+
+    let fallback = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "missing".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(fallback.materialized_row_count, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
